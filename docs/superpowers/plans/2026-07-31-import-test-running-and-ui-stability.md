@@ -596,7 +596,7 @@ Expected: all focused tests PASS.
 
 - [ ] **Step 6: Build and inspect the timestamped Linux archive**
 
-Use the repository's existing packaging script. Verify the archive excludes `.env`, `*.db`, logs, virtual environments, previous archives, `.git`, and `.superpowers`; verify it includes `requirements.txt`, application code, templates, static assets, README and deployment scripts.
+Use the repository's existing packaging script. Verify the archive excludes `*.db`, logs, virtual environments, previous archives, `.git`, and `.superpowers`; verify it includes `.env`, `.env.example`, `pyproject.toml`, application code, templates, static assets and README. Because `.env` may contain credentials, report that the archive must be transferred and stored securely.
 
 - [ ] **Step 7: Confirm the implementation worktree is clean**
 
