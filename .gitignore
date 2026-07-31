@@ -16,4 +16,5 @@ outputs/
 backups/
 .package-*/
 .superpowers/
+.worktrees/
 .tmp-cytoscape/
