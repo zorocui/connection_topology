@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}连接拓扑 · 连接图谱{% endblock %}
+{% block eyebrow %}连接关系图{% endblock %}
+{% block heading %}连接拓扑{% endblock %}
+{% block head %}
+<script src="{{ url_for('static', path='vendor/cytoscape.min.js') }}"></script>
+{% endblock %}
+{% block content %}
+<section class="topology-workbench reveal">
+  <div class="mode-switch" role="group" aria-label="拓扑模式">
+    <button type="button" class="active" data-mode="device">设备模式</button>
+    <button type="button" data-mode="cluster">集群模式</button>
+    <span id="snapshot-note">选择设备后显示其最新成功快照</span>
+  </div>
+  <div class="topology-toolbar">
+    <label id="device-filter-wrap">目标设备
+      <select id="device-filter">
+        <option value="">选择一台设备</option>
+        {% for device in devices %}
+        <option value="{{ device.id }}">{{ device.name }} · {{ device.host }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label id="cluster-filter-wrap" hidden>目标集群
+      <select id="cluster-filter">
+        <option value="">选择一个集群</option>
+        {% for cluster in clusters %}
+        <option value="cluster-{{ cluster.id }}">{{ cluster.name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>时间范围
+      <select id="topology-window">
+        <option value="current">当前</option>
+        <option value="1d">1d</option>
+        <option value="3d">3d</option>
+        <option value="7d">7d</option>
+      </select>
+    </label>
+    <label>协议
+      <select id="protocol-filter">
+        <option value="">全部</option><option value="tcp">TCP</option><option value="udp">UDP</option>
+      </select>
+    </label>
+    <label>状态
+      <select id="state-filter">
+        <option value="">全部</option><option value="ESTABLISHED">ESTABLISHED</option>
+        <option value="LISTEN">LISTEN</option><option value="TIME_WAIT">TIME_WAIT</option>
+      </select>
+    </label>
+    <label class="grow">进程筛选
+      <input id="process-filter" type="search" placeholder="nginx / sqlservr / PID">
+    </label>
+    <button id="scan-button" class="button primary" type="button">立即采集</button>
+  </div>
+
+  <div class="topology-stage">
+    <div class="canvas-wrap">
+      <div class="canvas-grid" aria-hidden="true"></div>
+      <div class="canvas-tools" aria-label="拓扑视图控制">
+        <button id="fit-topology-button" class="button" type="button">适配全图</button>
+        <button id="reset-topology-button" class="button" type="button">重置视图</button>
+      </div>
+      <div id="cy" role="img" aria-label="服务器连接拓扑图"></div>
+      <div id="topology-empty" class="canvas-empty">
+        <span class="radar"></span>
+        <h2>等待选择目标设备</h2>
+        <p>拓扑将按对端 IP 聚合连接，点击节点或边查看端口与进程。</p>
+      </div>
+      <div class="canvas-legend">
+        <span><i class="server"></i>服务器</span>
+        <span><i class="peer"></i>对端</span>
+        <span><i class="edge"></i>连接数量</span>
+        <span><i class="edge disconnected"></i>已断开连接</span>
+      </div>
+    </div>
+    <aside id="detail-drawer" class="detail-drawer">
+      <p class="eyebrow">连接详情</p>
+      <h2>选择连接</h2>
+      <p class="muted">点击拓扑中的节点或边，查看协议、端口、状态与进程信息。</p>
+    </aside>
+  </div>
+</section>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', path='js/topology.js') }}?v=20260731-history-sql-v2"></script>
+{% endblock %}

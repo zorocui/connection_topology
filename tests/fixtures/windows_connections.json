@@ -1,0 +1,5 @@
+[
+  {"Protocol":"tcp","LocalAddress":"10.0.0.12","LocalPort":49830,"RemoteAddress":"10.0.0.20","RemotePort":1433,"State":"Established","OwningProcess":4412,"ProcessName":"sqlservr"},
+  {"Protocol":"udp","LocalAddress":"0.0.0.0","LocalPort":5353,"RemoteAddress":null,"RemotePort":null,"State":null,"OwningProcess":0,"ProcessName":null}
+]
+

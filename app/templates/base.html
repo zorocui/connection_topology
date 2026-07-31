@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}连接图谱{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', path='css/app.css') }}">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="/">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span><b>连接图谱</b><small>服务器连接监控</small></span>
+      </a>
+      <nav aria-label="主导航">
+        <a class="{{ 'active' if active == 'dashboard' else '' }}" href="/">
+          <span>01</span>态势总览
+        </a>
+        <a class="{{ 'active' if active == 'topology' else '' }}" href="/topology">
+          <span>02</span>连接拓扑
+        </a>
+        <a class="{{ 'active' if active == 'devices' else '' }}" href="/devices">
+          <span>03</span>设备管理
+        </a>
+        <a class="{{ 'active' if active == 'clusters' else '' }}" href="/clusters">
+          <span>04</span>集群管理
+        </a>
+        <a class="{{ 'active' if active == 'history' else '' }}" href="/history">
+          <span>05</span>采集历史
+        </a>
+        <a class="{{ 'active' if active == 'settings' else '' }}" href="/settings">
+          <span>06</span>系统设置
+        </a>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="pulse"></span>
+        <div><b>本地控制</b><small>只读远程采集</small></div>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">{% block eyebrow %}网络运维{% endblock %}</p>
+          <h1>{% block heading %}连接态势{% endblock %}</h1>
+        </div>
+        <div class="topbar-meta">
+          <span id="clock">--:--:--</span>
+          <small>中国标准时间</small>
+        </div>
+      </header>
+
+      <section class="content">
+        {% block content %}{% endblock %}
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script>
+    const toast = (message, type = "ok") => {
+      const box = document.getElementById("toast");
+      box.textContent = message;
+      box.className = `toast show ${type}`;
+      window.setTimeout(() => box.className = "toast", 3600);
+    };
+    const escapeHtml = (value) => String(value ?? "")
+      .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+    const updateClock = () => {
+      document.getElementById("clock").textContent =
+        new Intl.DateTimeFormat("zh-CN", {
+          hour: "2-digit", minute: "2-digit", second: "2-digit",
+          hour12: false, timeZone: "Asia/Shanghai"
+        }).format(new Date());
+    };
+    updateClock();
+    window.setInterval(updateClock, 1000);
+  </script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

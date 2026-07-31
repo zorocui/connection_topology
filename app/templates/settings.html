@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}系统设置 · 连接图谱{% endblock %}
+{% block eyebrow %}系统策略{% endblock %}
+{% block heading %}系统设置{% endblock %}
+{% block content %}
+<div class="settings-grid reveal">
+  <section class="panel">
+    <div class="panel-head"><div><p class="eyebrow">数据保留</p><h2>历史保留策略</h2></div></div>
+    <form id="settings-form" class="setting-row">
+      <div><b>系统默认保留时间</b><p>设备未自定义且所属集群也未自定义时使用此设置。每天自动清理过期采集与连接记录。</p></div>
+      <label><input id="retention-days" type="number" min="1" max="3650" value="{{ retention_days }}"> 天</label>
+      <button class="button primary" type="submit">保存策略</button>
+    </form>
+  </section>
+  <aside class="notice-panel">
+    <p class="eyebrow">安全说明</p>
+    <h2>部署边界</h2>
+    <p>当前版本面向单管理员环境，默认仅监听本机。若改为内网监听，请在反向代理层增加访问控制。</p>
+    <ul><li>密码使用 Fernet 加密</li><li>远程命令固定且只读</li><li>日志自动隐藏认证信息</li></ul>
+  </aside>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+  document.getElementById("settings-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const response = await fetch("/api/settings", {
+      method: "PUT", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({history_retention_days: Number(document.getElementById("retention-days").value)})
+    });
+    toast(response.ok ? "保留策略已更新" : "保存失败", response.ok ? "ok" : "error");
+  });
+</script>
+{% endblock %}

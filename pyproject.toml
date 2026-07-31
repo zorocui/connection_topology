@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "connection-topology"
+version = "0.1.0"
+description = "Linux SSH and Windows WinRM connection topology monitor"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+  "fastapi>=0.116,<1",
+  "uvicorn[standard]>=0.35,<1",
+  "sqlalchemy>=2.0,<3",
+  "jinja2>=3.1,<4",
+  "python-multipart>=0.0.20,<1",
+  "apscheduler>=3.11,<4",
+  "paramiko>=3.5,<4",
+  "cryptography>=45,<46",
+  "pydantic-settings>=2.10,<3",
+  "openpyxl>=3.1,<4",
+]
+
+[project.optional-dependencies]
+windows = [
+  "pywinrm>=0.5,<1",
+]
+test = [
+  "httpx>=0.28,<1",
+  "pytest>=8.4,<9",
+  "pytest-cov>=6.2,<7",
+  "ruff>=0.12,<1",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+ignore = ["B008"]

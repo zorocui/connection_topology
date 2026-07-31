@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}态势总览 · 连接图谱{% endblock %}
+{% block eyebrow %}实时网络态势{% endblock %}
+{% block heading %}连接态势总览{% endblock %}
+{% block content %}
+<div class="metric-grid reveal">
+  <article class="metric signal">
+    <p>受管设备</p><strong>{{ "%02d"|format(device_count) }}</strong>
+    <span>{{ healthy_count }} 台最近采集成功</span>
+  </article>
+  <article class="metric">
+    <p>当前连接</p><strong>{{ active_connections }}</strong>
+    <span>各设备最新成功快照合计</span>
+  </article>
+  <article class="metric warn">
+    <p>失败批次</p><strong>{{ failed_count }}</strong>
+    <span>保留期内累计</span>
+  </article>
+  <article class="metric">
+    <p>采集策略</p><strong>自动</strong>
+    <span>每台设备独立周期</span>
+  </article>
+</div>
+
+<div class="dashboard-grid reveal delay-1">
+  <section class="panel">
+    <div class="panel-head">
+      <div><p class="eyebrow">设备运行状态</p><h2>设备状态</h2></div>
+      <a class="text-link" href="/devices">管理设备 →</a>
+    </div>
+    {% if devices %}
+    <div class="device-strip">
+      {% for device in devices %}
+      <a href="/topology?device={{ device.id }}" class="device-tile">
+        <span class="status-dot {{ device.last_scan_status.value if device.last_scan_status else 'idle' }}"></span>
+        <div>
+          <b>{{ device.name }}</b>
+          <small>{{ device.host }} · {{ device.os_type.value|upper }}</small>
+        </div>
+        <em>{{ device.scan_interval_minutes }}m</em>
+      </a>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">
+      <span>∅</span><h3>尚未接入设备</h3>
+      <p>添加首台 Linux 或 Windows 服务器后，连接态势会在这里出现。</p>
+      <a class="button primary" href="/devices">添加设备</a>
+    </div>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div><p class="eyebrow">最近采集任务</p><h2>最近采集</h2></div>
+      <a class="text-link" href="/history">全部历史 →</a>
+    </div>
+    <div class="run-list">
+      {% for scan in recent_scans %}
+      <div class="run-row">
+        <span class="run-state {{ scan.status.value }}">{% if scan.status.value == "success" %}成功{% elif scan.status.value == "failed" %}失败{% else %}运行中{% endif %}</span>
+        <div><b>#{{ scan.id }} · 设备 {{ scan.device_id }}</b>
+          <small>{{ scan.started_at|beijing_time("%m-%d %H:%M:%S") }} · {% if scan.trigger_type.value == "manual" %}手动{% else %}定时{% endif %}</small>
+        </div>
+        <strong>{{ scan.connection_count }}</strong>
+      </div>
+      {% else %}
+      <p class="muted">还没有采集记录。</p>
+      {% endfor %}
+    </div>
+  </section>
+</div>
+{% endblock %}

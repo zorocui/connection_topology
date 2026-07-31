@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}采集历史 · 连接图谱{% endblock %}
+{% block eyebrow %}快照档案{% endblock %}
+{% block heading %}采集历史{% endblock %}
+{% block content %}
+<section class="panel reveal">
+  <div class="panel-head">
+    <div><p class="eyebrow">采集记录</p><h2>批次记录</h2></div>
+    <div class="inline-filters">
+      <select id="history-device"><option value="">全部设备</option>{% for device in devices %}<option value="{{ device.id }}">{{ device.name }}</option>{% endfor %}</select>
+      <select id="history-status"><option value="">全部状态</option><option value="success">成功</option><option value="failed">失败</option></select>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table id="history-table">
+      <thead><tr><th>批次</th><th>设备</th><th>触发</th><th>开始时间</th><th>状态</th><th>连接数</th><th>查看</th></tr></thead>
+      <tbody>
+      {% for scan in scans %}
+        <tr data-device="{{ scan.device_id }}" data-status="{{ scan.status.value }}">
+          <td class="mono">#{{ "%05d"|format(scan.id) }}</td>
+          <td>设备 {{ scan.device_id }}</td>
+          <td>{% if scan.trigger_type.value == "manual" %}手动{% else %}定时{% endif %}</td>
+          <td>{{ scan.started_at|beijing_time }}</td>
+          <td><span class="run-state {{ scan.status.value }}">{% if scan.status.value == "success" %}成功{% elif scan.status.value == "failed" %}失败{% else %}运行中{% endif %}</span>
+            {% if scan.error_message %}<small class="error-text">{{ scan.error_message }}</small>{% endif %}
+          </td>
+          <td>{{ scan.connection_count }}</td>
+          <td>{% if scan.status.value == "success" %}<a class="text-link" href="/topology?scan={{ scan.id }}">打开拓扑 →</a>{% else %}—{% endif %}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7" class="muted">还没有采集记录。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
+{% block scripts %}
+<script>
+  const filterRows = () => {
+    const device = document.getElementById("history-device").value;
+    const status = document.getElementById("history-status").value;
+    document.querySelectorAll("#history-table tbody tr[data-device]").forEach(row => {
+      row.hidden = Boolean((device && row.dataset.device !== device) || (status && row.dataset.status !== status));
+    });
+  };
+  document.getElementById("history-device").addEventListener("change", filterRows);
+  document.getElementById("history-status").addEventListener("change", filterRows);
+</script>
+{% endblock %}

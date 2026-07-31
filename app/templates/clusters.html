@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}集群管理 · 连接图谱{% endblock %}
+{% block eyebrow %}集群与内部网络{% endblock %}
+{% block heading %}集群管理{% endblock %}
+{% block content %}
+<div class="cluster-management-grid reveal">
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">集群配置</p>
+        <h2 id="cluster-form-title">新建集群</h2>
+      </div>
+    </div>
+    <form id="cluster-form" class="form-grid">
+      <input id="cluster-id" type="hidden">
+      <label>集群名称
+        <input id="cluster-name" maxlength="100" required>
+      </label>
+      <label>描述
+        <input id="cluster-description" maxlength="500">
+      </label>
+      <label>历史保留天数
+        <input id="cluster-retention-days" type="number" min="1" max="3650"
+          placeholder="留空继承系统设置">
+        <small>留空时继承系统默认保留时间。</small>
+      </label>
+      <label>采集间隔（分钟）
+        <input id="cluster-scan-interval" type="number" min="1" max="10080"
+          value="5" required>
+      </label>
+      <label class="toggle">
+        <input id="cluster-scheduled-enabled" type="checkbox" checked>
+        <span></span>启用定时采集
+      </label>
+      <label class="wide">内部 IPv4 地址段
+        <textarea id="cluster-networks" rows="7"
+          placeholder="10.0.0.0/16&#10;10.96.0.0/12"></textarea>
+        <small>支持换行、中英文逗号分隔；仅支持 IPv4 CIDR。</small>
+      </label>
+      <div class="form-actions wide">
+        <button id="cancel-cluster-edit" class="button" type="button" hidden>取消编辑</button>
+        <button class="button primary" type="submit">保存集群</button>
+      </div>
+    </form>
+  </section>
+  <section class="panel">
+    <div class="panel-head">
+      <div><p class="eyebrow">集群清单</p><h2>已有集群</h2></div>
+      <span id="cluster-count" class="count-badge">0</span>
+    </div>
+    <div id="cluster-list" class="cluster-list">
+      <p class="muted">正在读取集群…</p>
+    </div>
+  </section>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', path='js/clusters.js') }}?v=20260731-scan-policy"></script>
+{% endblock %}
