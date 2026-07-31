@@ -3,6 +3,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
 from sqlalchemy import text
+from sqlalchemy.exc import TimeoutError as SATimeoutError
 
 from app.collectors.base import CollectionResult, CollectorError
 from app.models import (
@@ -15,6 +16,7 @@ from app.models import (
     OSType,
     ScanBatch,
 )
+from app.services import import_testing as import_testing_module
 from app.services.import_testing import ImportTestService
 
 
@@ -318,6 +320,58 @@ def test_future_database_exception_is_logged(app, caplog):
     assert "database unavailable" in caplog.text
 
 
+def test_database_operation_retries_transient_pool_timeout(app, monkeypatch):
+    service = ImportTestService(
+        app.state.session_factory,
+        app.state.cipher,
+        ImmediateExecutor(),
+        FakeCollector(),
+        FakeCollector(),
+    )
+    attempts = 0
+    waits = []
+
+    def operation():
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise SATimeoutError("pool busy")
+        return "ok"
+
+    monkeypatch.setattr(import_testing_module.time, "sleep", waits.append)
+
+    assert service._run_database_operation(operation) == "ok"
+    assert attempts == 3
+    assert waits == [0.1, 0.3]
+
+
+def test_unexpected_row_error_is_persisted_as_failure(app, monkeypatch):
+    batch_id, row_id, _ = seed_pending_row(app, "10.0.0.35")
+    service = ImportTestService(
+        app.state.session_factory,
+        app.state.cipher,
+        ImmediateExecutor(),
+        FakeCollector(),
+        FakeCollector(),
+    )
+
+    def fail_load(_row_id):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(service, "_load_target", fail_load)
+    service.test_row(row_id)
+
+    with app.state.session_factory() as session:
+        row = session.get(ImportRowResult, row_id)
+        batch = session.get(ImportBatch, batch_id)
+        assert row.test_status == ImportTestStatus.FAILED
+        assert "连接测试内部异常" in row.test_message
+        assert "database unavailable" in row.test_message
+        assert batch.status == ImportBatchStatus.COMPLETED
+        assert batch.test_pending_rows == 0
+        assert batch.test_failed_rows == 1
+
+
 def test_150_import_tests_complete_without_pool_timeout(app):
     count = 150
     batch_id = seed_pending_rows(app, count)
@@ -328,6 +382,7 @@ def test_150_import_tests_complete_without_pool_timeout(app):
         executor,
         FakeCollector(),
         FakeCollector(),
+        app.state.scan_queue.create_import_scan_batch,
     )
     try:
         service.schedule_batch(batch_id)
@@ -340,3 +395,41 @@ def test_150_import_tests_complete_without_pool_timeout(app):
         assert batch.test_pending_rows == 0
         assert batch.test_success_rows == count
         assert batch.test_failed_rows == 0
+        assert batch.scan_batch_id is not None
+        scan_batch = session.get(ScanBatch, batch.scan_batch_id)
+        assert scan_batch.total_tasks == count
+
+
+def test_1000_import_tests_complete_and_create_one_scan_batch(app):
+    count = 1000
+    batch_id = seed_pending_rows(app, count)
+    executor = ThreadPoolExecutor(max_workers=20)
+    service = ImportTestService(
+        app.state.session_factory,
+        app.state.cipher,
+        executor,
+        FakeCollector(),
+        FakeCollector(),
+        app.state.scan_queue.create_import_scan_batch,
+    )
+    try:
+        service.schedule_batch(batch_id)
+    finally:
+        executor.shutdown(wait=True)
+
+    with app.state.session_factory() as session:
+        batch = session.get(ImportBatch, batch_id)
+        first_scan_batch_id = batch.scan_batch_id
+        assert batch.status == ImportBatchStatus.COMPLETED
+        assert batch.test_pending_rows == 0
+        assert batch.test_success_rows == count
+        assert batch.test_failed_rows == 0
+        assert first_scan_batch_id is not None
+        scan_batch = session.get(ScanBatch, first_scan_batch_id)
+        assert scan_batch.total_tasks == count
+
+    service.resume_pending()
+
+    with app.state.session_factory() as session:
+        batch = session.get(ImportBatch, batch_id)
+        assert batch.scan_batch_id == first_scan_batch_id
