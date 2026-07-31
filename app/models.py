@@ -78,6 +78,7 @@ class ImportStatus(str, enum.Enum):
 
 class ImportTestStatus(str, enum.Enum):
     PENDING = "pending"
+    RUNNING = "running"
     SUCCESS = "success"
     FAILED = "failed"
     NOT_APPLICABLE = "not_applicable"
@@ -342,6 +343,7 @@ class ImportBatch(Base):
     skipped_rows: Mapped[int] = mapped_column(Integer, default=0)
     error_rows: Mapped[int] = mapped_column(Integer, default=0)
     test_pending_rows: Mapped[int] = mapped_column(Integer, default=0)
+    test_running_rows: Mapped[int] = mapped_column(Integer, default=0)
     test_success_rows: Mapped[int] = mapped_column(Integer, default=0)
     test_failed_rows: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

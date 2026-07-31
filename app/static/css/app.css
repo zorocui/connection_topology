@@ -233,11 +233,13 @@ input:focus, select:focus, button:focus-visible, a:focus-visible { outline: 2px 
 .import-drop p { color: var(--muted); margin-top: 5px; font-size: 10px; }
 .security-callout { margin-top: 14px; padding: 11px 13px; border-left: 3px solid var(--warn); background: rgba(255,180,84,.08); color: #d9bea0; font-size: 11px; }
 .import-result { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 16px; }
-.import-summary { display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; margin-bottom: 14px; }
+.import-summary { display: grid; grid-template-columns: repeat(9, minmax(0, 1fr)); gap: 8px; margin-bottom: 14px; }
 .import-summary div { padding: 10px; border: 1px solid var(--line); background: #091316; }
 .import-summary small, .import-summary b { display: block; }
 .import-summary small { color: var(--muted); font-size: 8px; }
 .import-summary b { margin-top: 7px; font: 15px var(--mono); }
+.import-progress-label { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; }
+.import-progress-label strong { color: var(--text); font-family: var(--mono); }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 22px; }
 .wide { grid-column: 1 / -1; }
 .toggle { display: flex; align-items: center; align-self: end; height: 38px; gap: 9px; }

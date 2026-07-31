@@ -103,17 +103,36 @@ class ImportTestService:
             self._submit(row_id)
 
     def resume_pending(self) -> None:
-        def load_pending_row_ids() -> list[int]:
+        def recover_and_load_pending_row_ids() -> list[int]:
             with self.session_factory() as session:
-                return list(
+                running_rows = list(
+                    session.scalars(
+                        select(ImportRowResult).where(
+                            ImportRowResult.test_status
+                            == ImportTestStatus.RUNNING
+                        )
+                    ).all()
+                )
+                affected_batch_ids = {row.batch_id for row in running_rows}
+                for row in running_rows:
+                    row.test_status = ImportTestStatus.PENDING
+                    row.test_message = None
+                session.flush()
+                for batch_id in affected_batch_ids:
+                    self._refresh_batch_counts(session, batch_id)
+                row_ids = list(
                     session.scalars(
                         select(ImportRowResult.id).where(
                             ImportRowResult.test_status == ImportTestStatus.PENDING
                         )
                     ).all()
                 )
+                session.commit()
+                return row_ids
 
-        row_ids = self._run_database_operation(load_pending_row_ids)
+        row_ids = self._run_database_operation(
+            recover_and_load_pending_row_ids
+        )
         for row_id in row_ids:
             self._submit(row_id)
         if self.batch_completed_callback:
@@ -144,6 +163,12 @@ class ImportTestService:
                 ImportRowResult.test_status == ImportTestStatus.PENDING,
             )
         ) or 0
+        batch.test_running_rows = session.scalar(
+            select(func.count()).select_from(ImportRowResult).where(
+                ImportRowResult.batch_id == batch_id,
+                ImportRowResult.test_status == ImportTestStatus.RUNNING,
+            )
+        ) or 0
         batch.test_success_rows = session.scalar(
             select(func.count()).select_from(ImportRowResult).where(
                 ImportRowResult.batch_id == batch_id,
@@ -156,9 +181,12 @@ class ImportTestService:
                 ImportRowResult.test_status == ImportTestStatus.FAILED,
             )
         ) or 0
-        if batch.test_pending_rows == 0:
+        if batch.test_pending_rows + batch.test_running_rows == 0:
             batch.status = ImportBatchStatus.COMPLETED
             batch.finished_at = datetime.now(timezone.utc)
+        else:
+            batch.status = ImportBatchStatus.TESTING
+            batch.finished_at = None
         return not was_completed and batch.status == ImportBatchStatus.COMPLETED
 
     def _load_target(
@@ -172,15 +200,23 @@ class ImportTestService:
                     return None
                 batch_id = row.batch_id
                 device = session.get(Device, row.device_id)
-                if device is None:
-                    return batch_id, None
-                return batch_id, ImportTestTarget(
-                    os_type=device.os_type,
-                    host=device.host,
-                    port=device.port,
-                    username=device.username,
-                    encrypted_password=device.encrypted_password,
+                target = (
+                    None
+                    if device is None
+                    else ImportTestTarget(
+                        os_type=device.os_type,
+                        host=device.host,
+                        port=device.port,
+                        username=device.username,
+                        encrypted_password=device.encrypted_password,
+                    )
                 )
+                row.test_status = ImportTestStatus.RUNNING
+                row.test_message = "正在测试连接"
+                session.flush()
+                self._refresh_batch_counts(session, batch_id)
+                session.commit()
+                return batch_id, target
 
         return self._run_database_operation(load)
 
@@ -228,7 +264,10 @@ class ImportTestService:
             completed_batch_id: int | None = None
             with self.session_factory() as session:
                 row = session.get(ImportRowResult, row_id)
-                if row is None or row.test_status != ImportTestStatus.PENDING:
+                if row is None or row.test_status not in {
+                    ImportTestStatus.PENDING,
+                    ImportTestStatus.RUNNING,
+                }:
                     return None
                 row.test_status = outcome.status
                 row.test_message = outcome.message

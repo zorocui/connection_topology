@@ -362,6 +362,7 @@ def build_import_report(session: Session, batch_id: int) -> bytes:
     }
     test_names = {
         ImportTestStatus.PENDING: "待测试",
+        ImportTestStatus.RUNNING: "正在测试",
         ImportTestStatus.SUCCESS: "成功",
         ImportTestStatus.FAILED: "失败",
         ImportTestStatus.NOT_APPLICABLE: "不适用",

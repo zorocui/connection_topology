@@ -361,7 +361,16 @@
   );
   const resultBox = document.getElementById("import-result");
   const statusName = {importing: "正在导入", testing: "正在测试连接", completed: "已完成", failed: "失败"};
+  let expandedImportBatchId = null;
+  let expandedImportRowsHtml = "";
   const renderBatch = async (batch) => {
+    const completedTests = batch.test_success_rows + batch.test_failed_rows;
+    const testProgress = batch.imported_rows
+      ? Math.min(100, Math.round(completedTests * 100 / batch.imported_rows))
+      : 100;
+    const preservedRows = expandedImportBatchId === batch.id
+      ? expandedImportRowsHtml
+      : "";
     resultBox.hidden = false;
     resultBox.innerHTML = `<div class="import-summary">
       <div><small>批次</small><b>#${batch.id}</b></div>
@@ -369,14 +378,22 @@
       <div><small>已导入</small><b>${batch.imported_rows}</b></div>
       <div><small>已跳过</small><b>${batch.skipped_rows}</b></div>
       <div><small>错误</small><b>${batch.error_rows}</b></div>
+      <div><small>等待测试</small><b>${batch.test_pending_rows}</b></div>
+      <div><small>正在测试</small><b>${batch.test_running_rows}</b></div>
       <div><small>测试成功</small><b>${batch.test_success_rows}</b></div>
       <div><small>测试失败</small><b>${batch.test_failed_rows}</b></div>
+    </div>
+    <div class="import-progress-label">
+      <span>导入测试进度</span><strong>${testProgress}%</strong>
+    </div>
+    <div class="scan-progress" aria-label="导入测试进度 ${testProgress}%">
+      <i style="width:${testProgress}%"></i>
     </div>
     <div class="import-links">
       <button class="text-link link-button" type="button" onclick="loadImportRows(${batch.id})">查看逐行结果</button>
       <a class="text-link" href="/api/imports/${batch.id}/report">下载无密码结果报告 →</a>
     </div>
-    <div id="import-rows-${batch.id}" class="import-rows"></div>
+    <div id="import-rows-${batch.id}" class="import-rows">${preservedRows}</div>
     <div id="import-scan-${batch.id}" class="import-first-scan"></div>`;
     if (batch.scan_batch_id) renderImportScanBatch(batch.id, batch.scan_batch_id);
     if (batch.status !== "completed" && batch.status !== "failed") {
@@ -408,8 +425,8 @@
     if (!response.ok) return toast("读取逐行结果失败", "error");
     const rows = await response.json();
     const status = {imported: "已导入", skipped: "已跳过", error: "错误"};
-    const testStatus = {pending: "待测试", success: "成功", failed: "失败", not_applicable: "不适用"};
-    document.getElementById(`import-rows-${batchId}`).innerHTML = `<div class="table-wrap"><table>
+    const testStatus = {pending: "待测试", running: "正在测试", success: "成功", failed: "失败", not_applicable: "不适用"};
+    const rowsHtml = `<div class="table-wrap"><table>
       <thead><tr><th>行号</th><th>设备</th><th>地址</th><th>导入</th><th>连接测试</th><th>说明</th></tr></thead>
       <tbody>${rows.map(row => `<tr>
         <td>${row.row_number}</td><td>${escapeHtml(row.device_name || "—")}</td>
@@ -417,6 +434,10 @@
         <td>${testStatus[row.test_status]}</td>
         <td>${escapeHtml(row.test_message || row.import_message)}</td>
       </tr>`).join("")}</tbody></table></div>`;
+    expandedImportBatchId = batchId;
+    expandedImportRowsHtml = rowsHtml;
+    const container = document.getElementById(`import-rows-${batchId}`);
+    if (container) container.innerHTML = expandedImportRowsHtml;
   };
 
 </script>

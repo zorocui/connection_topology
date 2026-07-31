@@ -54,6 +54,7 @@ def test_mixed_import_encrypts_password_and_creates_cluster(app):
         assert batch.imported_rows == 1
         assert batch.error_rows == 1
         assert batch.skipped_rows == 1
+        assert batch.test_running_rows == 0
         device = session.scalar(select(Device).where(Device.host == "10.0.0.10"))
         assert device.port == 22
         assert "secret-1" not in device.encrypted_password
@@ -75,6 +76,19 @@ def test_mixed_import_encrypts_password_and_creates_cluster(app):
         assert b"secret-1" not in report
         report_book = load_workbook(BytesIO(report), data_only=True)
         assert report_book["导入结果"].max_row == 4
+
+        imported.test_status = ImportTestStatus.RUNNING
+        imported.test_message = "正在测试连接"
+        batch.test_pending_rows = 0
+        batch.test_running_rows = 1
+        session.commit()
+        running_report = load_workbook(
+            BytesIO(build_import_report(session, batch.id)),
+            data_only=True,
+        )
+        report_rows = list(running_report["导入结果"].values)
+        imported_report_row = next(row for row in report_rows if row[1] == "web-01")
+        assert imported_report_row[5:] == ("正在测试", "正在测试连接")
 
 
 def test_import_rejects_non_xlsx(app):

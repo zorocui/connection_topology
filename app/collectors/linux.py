@@ -1,4 +1,5 @@
 import re
+import time
 from collections.abc import Callable
 
 import paramiko
@@ -124,15 +125,39 @@ class LinuxCollector:
             raise CollectorError("connection_failed", f"SSH 连接失败: {exc}") from exc
 
     def _execute(self, client: paramiko.SSHClient, command: str) -> tuple[int, str, str]:
+        channel = None
         try:
-            _, stdout, stderr = client.exec_command(command, timeout=self.timeout)
-            exit_code = stdout.channel.recv_exit_status()
+            _, stdout, _ = client.exec_command(command, timeout=self.timeout)
+            channel = stdout.channel
+            deadline = time.monotonic() + self.timeout
+            output_chunks: list[bytes] = []
+            error_chunks: list[bytes] = []
+            while True:
+                while channel.recv_ready():
+                    output_chunks.append(channel.recv(65536))
+                while channel.recv_stderr_ready():
+                    error_chunks.append(channel.recv_stderr(65536))
+                if channel.exit_status_ready():
+                    while channel.recv_ready():
+                        output_chunks.append(channel.recv(65536))
+                    while channel.recv_stderr_ready():
+                        error_chunks.append(channel.recv_stderr(65536))
+                    break
+                if time.monotonic() >= deadline:
+                    channel.close()
+                    raise CollectorError(
+                        "command_timeout",
+                        "远程 ss 命令执行超时",
+                    )
+                time.sleep(0.01)
             return (
-                exit_code,
-                stdout.read().decode("utf-8", errors="replace"),
-                stderr.read().decode("utf-8", errors="replace"),
+                channel.recv_exit_status(),
+                b"".join(output_chunks).decode("utf-8", errors="replace"),
+                b"".join(error_chunks).decode("utf-8", errors="replace"),
             )
         except TimeoutError as exc:
+            if channel is not None:
+                channel.close()
             raise CollectorError("command_timeout", "远程 ss 命令执行超时") from exc
         except paramiko.SSHException as exc:
             raise CollectorError("command_failed", "无法执行远程 ss 命令") from exc
