@@ -29,6 +29,15 @@ def test_template_has_required_sheets_and_headers():
     workbook = load_workbook(BytesIO(build_import_template()), data_only=True)
     assert workbook.sheetnames == ["设备导入", "填写说明"]
     assert tuple(cell.value for cell in workbook["设备导入"][1]) == IMPORT_HEADERS
+    instructions = {
+        row[0]: row[2]
+        for row in workbook["填写说明"].iter_rows(
+            min_row=2,
+            values_only=True,
+        )
+    }
+    assert "新集群" in instructions["采集间隔（分钟）"]
+    assert "已有集群" in instructions["采集间隔（分钟）"]
 
 
 def test_mixed_import_encrypts_password_and_creates_cluster(app):
@@ -116,6 +125,82 @@ def test_imported_device_uses_existing_cluster_scan_policy(app):
 
         assert device.scan_interval_minutes == 17
         assert device.scheduled_enabled is False
+
+
+def test_import_creates_cluster_with_row_scan_policy(app):
+    content = workbook_bytes(
+        [
+            (
+                "new-worker",
+                "10.0.0.60",
+                "linux",
+                22,
+                "ops",
+                "secret",
+                "new-policy-cluster",
+                60,
+                "否",
+            )
+        ]
+    )
+
+    with app.state.session_factory() as session:
+        import_devices(session, app.state.cipher, "devices.xlsx", content)
+        cluster = session.scalar(
+            select(Cluster).where(Cluster.name == "new-policy-cluster")
+        )
+        device = session.scalar(
+            select(Device).where(Device.host == "10.0.0.60")
+        )
+
+        assert cluster.scan_interval_minutes == 60
+        assert cluster.scheduled_enabled is False
+        assert device.scan_interval_minutes == 60
+        assert device.scheduled_enabled is False
+
+
+def test_import_uses_first_row_policy_for_same_new_cluster(app):
+    content = workbook_bytes(
+        [
+            (
+                "first-worker",
+                "10.0.0.61",
+                "linux",
+                22,
+                "ops",
+                "secret",
+                "shared-new-cluster",
+                60,
+                "否",
+            ),
+            (
+                "second-worker",
+                "10.0.0.62",
+                "linux",
+                22,
+                "ops",
+                "secret",
+                "shared-new-cluster",
+                10,
+                "是",
+            ),
+        ]
+    )
+
+    with app.state.session_factory() as session:
+        import_devices(session, app.state.cipher, "devices.xlsx", content)
+        cluster = session.scalar(
+            select(Cluster).where(Cluster.name == "shared-new-cluster")
+        )
+        devices = session.scalars(
+            select(Device).where(Device.cluster_id == cluster.id)
+        ).all()
+
+        assert cluster.scan_interval_minutes == 60
+        assert cluster.scheduled_enabled is False
+        assert len(devices) == 2
+        assert {device.scan_interval_minutes for device in devices} == {60}
+        assert {device.scheduled_enabled for device in devices} == {False}
 
 
 def test_template_download_api(client):

@@ -100,8 +100,16 @@ def build_import_template() -> bytes:
         ("用户名", "是", "远程登录用户名"),
         ("密码", "是", "明文仅用于导入；导入后请删除或加密保存源文件"),
         ("所属集群", "否", "不存在时自动创建，留空表示未分组"),
-        ("采集间隔（分钟）", "否", "大于等于 1，默认 5"),
-        ("启用定时采集", "否", "填写 是 或 否，默认 是"),
+        (
+            "采集间隔（分钟）",
+            "否",
+            "未分组设备直接采用；新集群以首条成功记录为准；已有集群继承集群设置",
+        ),
+        (
+            "启用定时采集",
+            "否",
+            "填写 是 或 否；未分组设备直接采用；新集群以首条成功记录为准；已有集群继承集群设置",
+        ),
     )
     for row in instructions:
         guide.append(row)
@@ -249,7 +257,12 @@ def import_devices(
             if parsed["cluster_name"]:
                 cluster = find_cluster_by_name(session, parsed["cluster_name"])
                 if cluster is None:
-                    cluster = create_cluster(session, parsed["cluster_name"])
+                    cluster = create_cluster(
+                        session,
+                        parsed["cluster_name"],
+                        scan_interval_minutes=parsed["scan_interval_minutes"],
+                        scheduled_enabled=parsed["scheduled_enabled"],
+                    )
             scan_interval, scheduled_enabled = cluster_scan_values(
                 cluster,
                 parsed["scan_interval_minutes"],

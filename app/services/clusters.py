@@ -78,6 +78,9 @@ def create_cluster(
     name: str,
     description: str | None = None,
     internal_networks: list[str] | None = None,
+    *,
+    scan_interval_minutes: int = 5,
+    scheduled_enabled: bool = True,
 ) -> Cluster:
     normalized = normalize_cluster_name(name)
     if find_cluster_by_name(session, normalized):
@@ -85,6 +88,8 @@ def create_cluster(
     cluster = Cluster(
         name=normalized,
         description=description.strip() if description and description.strip() else None,
+        scan_interval_minutes=scan_interval_minutes,
+        scheduled_enabled=scheduled_enabled,
     )
     session.add(cluster)
     session.flush()
