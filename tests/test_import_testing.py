@@ -210,7 +210,65 @@ def test_network_wait_does_not_hold_database_connections(app):
     with app.state.session_factory() as session:
         batch = session.get(ImportBatch, batch_id)
         assert batch.test_pending_rows == 0
+        assert batch.test_running_rows == 0
         assert batch.test_success_rows == count
+
+
+def test_claimed_row_is_visible_as_running(app):
+    batch_id, row_id, _ = seed_pending_row(app, "10.0.0.40")
+    collector = BarrierCollector(1)
+    executor = ThreadPoolExecutor(max_workers=1)
+    service = ImportTestService(
+        app.state.session_factory,
+        app.state.cipher,
+        executor,
+        collector,
+        collector,
+    )
+    try:
+        service.schedule_batch(batch_id)
+        collector.barrier.wait(timeout=10)
+        with app.state.session_factory() as session:
+            row = session.get(ImportRowResult, row_id)
+            batch = session.get(ImportBatch, batch_id)
+            assert row.test_status == ImportTestStatus.RUNNING
+            assert row.test_message == "正在测试连接"
+            assert batch.test_pending_rows == 0
+            assert batch.test_running_rows == 1
+            assert batch.status == ImportBatchStatus.TESTING
+    finally:
+        collector.release.set()
+        executor.shutdown(wait=True)
+
+
+def test_resume_pending_recovers_stale_running_row(app):
+    batch_id, row_id, _ = seed_pending_row(app, "10.0.0.41")
+    with app.state.session_factory() as session:
+        row = session.get(ImportRowResult, row_id)
+        row.test_status = ImportTestStatus.RUNNING
+        row.test_message = "正在测试连接"
+        batch = session.get(ImportBatch, batch_id)
+        batch.test_pending_rows = 0
+        batch.test_running_rows = 1
+        session.commit()
+
+    service = ImportTestService(
+        app.state.session_factory,
+        app.state.cipher,
+        ImmediateExecutor(),
+        FakeCollector(),
+        FakeCollector(),
+    )
+    service.resume_pending()
+
+    with app.state.session_factory() as session:
+        row = session.get(ImportRowResult, row_id)
+        batch = session.get(ImportBatch, batch_id)
+        assert row.test_status == ImportTestStatus.SUCCESS
+        assert batch.test_pending_rows == 0
+        assert batch.test_running_rows == 0
+        assert batch.test_success_rows == 1
+        assert batch.status == ImportBatchStatus.COMPLETED
 
 
 def test_completed_row_is_not_overwritten(app):
@@ -393,6 +451,7 @@ def test_150_import_tests_complete_without_pool_timeout(app):
         batch = session.get(ImportBatch, batch_id)
         assert batch.status == ImportBatchStatus.COMPLETED
         assert batch.test_pending_rows == 0
+        assert batch.test_running_rows == 0
         assert batch.test_success_rows == count
         assert batch.test_failed_rows == 0
         assert batch.scan_batch_id is not None
@@ -422,6 +481,7 @@ def test_1000_import_tests_complete_and_create_one_scan_batch(app):
         first_scan_batch_id = batch.scan_batch_id
         assert batch.status == ImportBatchStatus.COMPLETED
         assert batch.test_pending_rows == 0
+        assert batch.test_running_rows == 0
         assert batch.test_success_rows == count
         assert batch.test_failed_rows == 0
         assert first_scan_batch_id is not None
