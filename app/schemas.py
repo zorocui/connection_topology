@@ -239,6 +239,7 @@ class ImportBatchRead(BaseModel):
     skipped_rows: int
     error_rows: int
     test_pending_rows: int
+    test_running_rows: int
     test_success_rows: int
     test_failed_rows: int
     created_at: datetime
