@@ -171,7 +171,13 @@
           {% for device in devices %}
           <tr data-device-row data-device-id="{{ device.id }}">
             <td><span class="status-dot {{ device.last_scan_status.value if device.last_scan_status else 'idle' }}"></span></td>
-            <td><b>{{ device.name }}</b><small>{{ device.username }}@{{ device.host }}:{{ device.port }}{% if device.cluster %} · {{ device.cluster.name }}{% endif %}</small></td>
+            <td>
+              <b>{{ device.name }}</b>
+              <small>{{ device.username }}@{{ device.host }}:{{ device.port }}{% if device.cluster %} · {{ device.cluster.name }}{% endif %}</small>
+              {% if not device.collection_enabled %}
+              <small class="cluster-managed-hint">仅标注</small>
+              {% endif %}
+            </td>
             <td><span class="mono-tag">{{ "SSH" if device.os_type.value == "linux" else "WINRM" }}</span></td>
             <td>
               {{ device.scan_interval_minutes }} min
@@ -199,7 +205,11 @@
               </div>
             </td>
             <td class="actions">
-              <button data-scan="{{ device.id }}" class="icon-button" title="立即采集">↻</button>
+              {% if not device.collection_enabled %}
+              <button class="icon-button" type="button" disabled title="未配置采集凭据">↻</button>
+              {% else %}
+              <button data-scan="{{ device.id }}" class="icon-button" type="button" title="立即采集">↻</button>
+              {% endif %}
               <a class="icon-button" href="/topology?device={{ device.id }}" title="查看拓扑">⌁</a>
               <button data-delete="{{ device.id }}" class="icon-button danger" title="删除设备">×</button>
             </td>

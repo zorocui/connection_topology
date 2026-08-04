@@ -2,6 +2,7 @@ from pathlib import Path
 
 DEVICE_LIST_JS = Path("app/static/js/device-list.js")
 APP_CSS = Path("app/static/css/app.css")
+DEVICE_TEMPLATE = Path("app/templates/devices.html")
 
 
 def script_text() -> str:
@@ -41,3 +42,11 @@ def test_direct_page_jump_clamps_and_supports_enter():
     assert "Math.min(Math.max(requestedPage, 1), totalPages)" in script
     assert 'event.key !== "Enter"' in script
     assert 'toast("请输入有效页码", "error")' in script
+
+
+def test_marker_device_is_labeled_and_scan_is_disabled():
+    template = DEVICE_TEMPLATE.read_text(encoding="utf-8")
+    assert "{% if not device.collection_enabled %}" in template
+    assert "仅标注" in template
+    assert 'title="未配置采集凭据"' in template
+    assert 'data-scan="{{ device.id }}"' in template

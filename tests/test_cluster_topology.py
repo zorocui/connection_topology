@@ -114,6 +114,32 @@ def test_cluster_topology_hides_internal_and_aggregates_external(app):
         assert db.id
 
 
+def test_cluster_topology_includes_marker_member_without_fake_edges(app):
+    with app.state.session_factory() as session:
+        cluster = Cluster(name="marker-cluster")
+        session.add(cluster)
+        session.flush()
+        marker = add_device(
+            session,
+            app,
+            "marker-only",
+            "10.10.10.10",
+            cluster,
+        )
+        marker.collection_enabled = False
+        session.commit()
+
+        topology = build_cluster_topology(session, LiteralResolver())
+
+        node = next(
+            node
+            for node in topology["nodes"]
+            if node["data"]["id"] == f"cluster-{cluster.id}"
+        )
+        assert [member["id"] for member in node["data"]["members"]] == [marker.id]
+        assert topology["edges"] == []
+
+
 def test_cluster_topology_returns_only_target_one_hop(app):
     with app.state.session_factory() as session:
         selected = Cluster(name="目标集群")
