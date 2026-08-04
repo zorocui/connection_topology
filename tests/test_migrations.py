@@ -60,14 +60,16 @@ def test_cluster_internal_network_table_and_indexes_are_created(tmp_path):
     assert "ix_scan_device_status_started" in {
         index["name"] for index in inspector.get_indexes("scan_runs")
     }
-    assert "ix_connection_history_service" in {
+    connection_indexes = {
         index["name"]
         for index in inspector.get_indexes("connection_records")
     }
+    assert "ix_connection_history_service" in connection_indexes
+    assert "ix_connection_remote_scan" in connection_indexes
     with engine.connect() as connection:
         assert connection.execute(
             text("SELECT MAX(version) FROM schema_versions")
-        ).scalar() == 7
+        ).scalar() == 8
 
 
 def test_version_six_changes_legacy_default_but_preserves_custom_value(tmp_path):

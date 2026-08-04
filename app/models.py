@@ -305,6 +305,11 @@ class ConnectionRecord(Base):
             "protocol",
             "process_name",
         ),
+        Index(
+            "ix_connection_remote_scan",
+            "remote_ip",
+            "scan_run_id",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
