@@ -148,6 +148,46 @@ def test_cluster_topology_returns_only_target_one_hop(app):
         }
 
 
+def test_current_target_cluster_keeps_only_outbound_and_inbound_one_hop(app):
+    with app.state.session_factory() as session:
+        selected = Cluster(name="当前目标集群")
+        peer = Cluster(name="当前对端集群")
+        unrelated = Cluster(name="当前无关集群")
+        session.add_all([selected, peer, unrelated])
+        session.flush()
+        source = add_device(session, app, "source-current", "10.0.0.1", selected)
+        inbound = add_device(session, app, "inbound-current", "10.0.1.1", peer)
+        other = add_device(session, app, "other-current", "10.0.2.1", unrelated)
+        add_scan(session, source, [inbound.host, "203.0.113.8"])
+        add_scan(session, inbound, [source.host])
+        add_scan(
+            session,
+            other,
+            [f"198.51.100.{index}" for index in range(1, 201)],
+        )
+        session.commit()
+
+        topology = build_cluster_topology(
+            session,
+            LiteralResolver(),
+            target_cluster_id=selected.id,
+        )
+
+        assert {
+            (edge["data"]["source"], edge["data"]["target"])
+            for edge in topology["edges"]
+        } == {
+            (f"cluster-{selected.id}", f"cluster-{peer.id}"),
+            (f"cluster-{selected.id}", "external-203.0.113.8"),
+            (f"cluster-{peer.id}", f"cluster-{selected.id}"),
+        }
+        assert not any(
+            detail["source_device_id"] == other.id
+            for edge in topology["edges"]
+            for detail in edge["data"]["connections"]
+        )
+
+
 def test_historical_target_cluster_keeps_outbound_and_inbound(app):
     now = datetime(2026, 7, 31, 2, 0, tzinfo=timezone.utc)
     with app.state.session_factory() as session:

@@ -1,6 +1,6 @@
 from sqlalchemy import Engine, inspect, text
 
-LATEST_SCHEMA_VERSION = 7
+LATEST_SCHEMA_VERSION = 8
 
 
 def run_migrations(engine: Engine) -> None:
@@ -98,6 +98,12 @@ def run_migrations(engine: Engine) -> None:
                     "CREATE INDEX IF NOT EXISTS ix_connection_history_service "
                     "ON connection_records "
                     "(scan_run_id, remote_ip, remote_port, protocol, process_name)"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_connection_remote_scan "
+                    "ON connection_records (remote_ip, scan_run_id)"
                 )
             )
         connection.execute(
