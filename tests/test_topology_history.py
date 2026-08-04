@@ -9,6 +9,7 @@ from app.models import (
     ScanTrigger,
 )
 from app.services.topology_history import (
+    aggregate_current_connections,
     aggregate_historical_connections,
     aggregate_service_connections,
     load_current_scans,
@@ -147,6 +148,69 @@ def test_load_current_scans_can_skip_connections(app):
 
         assert loaded[device_id].id == current_id
         assert "connections" not in loaded[device_id].__dict__
+
+
+def test_current_sql_filters_to_outbound_and_inbound_candidates(app):
+    with app.state.session_factory() as session:
+        selected = add_device(session, app, "selected-current", "10.0.0.10")
+        inbound = add_device(session, app, "inbound-current", "10.0.0.20")
+        unrelated = add_device(session, app, "unrelated-current", "10.0.0.30")
+        selected_scan = add_scan(
+            session,
+            selected,
+            started_at=NOW,
+            remote_ip=selected.host,
+        )
+        inbound_scan = add_scan(
+            session,
+            inbound,
+            started_at=NOW,
+            remote_ip=selected.host,
+        )
+        unrelated_scan = add_scan(
+            session,
+            unrelated,
+            started_at=NOW,
+            remote_ip="198.51.100.9",
+        )
+        session.commit()
+        latest = {
+            selected.id: selected_scan,
+            inbound.id: inbound_scan,
+            unrelated.id: unrelated_scan,
+        }
+
+        rows = aggregate_current_connections(
+            session,
+            latest,
+            source_device_ids={selected.id},
+            inbound_addresses={selected.host},
+        )
+
+        assert {
+            (row["source_device_id"], row["remote_ip"])
+            for row in rows
+        } == {
+            (selected.id, selected.host),
+            (inbound.id, selected.host),
+        }
+
+
+def test_current_sql_matches_existing_python_aggregation(app):
+    with app.state.session_factory() as session:
+        device = add_device(session, app, "current-equivalent", "10.0.0.40")
+        current = add_scan(
+            session,
+            device,
+            started_at=NOW,
+            remote_ip="::ffff:203.0.113.8",
+        )
+        session.commit()
+
+        expected = aggregate_service_connections([current], {current.id})
+        actual = aggregate_current_connections(session, {device.id: current})
+
+        assert service_projection(actual) == service_projection(expected)
 
 
 def test_aggregate_service_connections_ignores_local_port_and_pid(app):

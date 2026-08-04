@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
@@ -17,6 +17,7 @@ WINDOW_DELTAS = {
     "3d": timedelta(hours=72),
     "7d": timedelta(hours=168),
 }
+ConnectionObservation = tuple[int, int, datetime, ConnectionRecord]
 
 
 def load_current_scans(
@@ -111,61 +112,58 @@ def _service_key(device_id: int, row: ConnectionRecord) -> tuple:
     )
 
 
-def aggregate_service_connections(
-    scans: Sequence[ScanRun],
+def _aggregate_connection_observations(
+    observations: Iterable[ConnectionObservation],
     current_scan_ids: Collection[int],
 ) -> list[dict]:
     from app.services.topology import connection_dict
 
     current_ids = set(current_scan_ids)
     groups: dict[tuple, dict] = {}
-    ordered_scans = sorted(scans, key=lambda scan: (scan.started_at, scan.id))
+    for scan_id, device_id, started_at, row in sorted(
+        observations,
+        key=lambda item: (item[2], item[0], item[3].id),
+    ):
+        if row.remote_ip is None or is_loopback_address(row.remote_ip):
+            continue
+        key = _service_key(device_id, row)
+        normalized_remote = key[2]
+        if normalized_remote is None:
+            continue
+        values = connection_dict(row)
+        values["remote_ip"] = normalized_remote
+        bucket = groups.get(key)
+        if bucket is None:
+            bucket = {
+                **values,
+                "source_device_id": device_id,
+                "scan_id": scan_id,
+                "scan_time": started_at.isoformat(),
+                "is_current": False,
+                "first_seen": started_at.isoformat(),
+                "last_seen": started_at.isoformat(),
+                "observation_count": 0,
+                "_scan_ids": set(),
+                "_local_ips": set(),
+                "_local_ports": set(),
+                "_pids": set(),
+            }
+            groups[key] = bucket
+        else:
+            old_hostname = bucket.get("remote_hostname")
+            bucket.update(values)
+            if not bucket.get("remote_hostname"):
+                bucket["remote_hostname"] = old_hostname
+            bucket["scan_id"] = scan_id
+            bucket["scan_time"] = started_at.isoformat()
+            bucket["last_seen"] = started_at.isoformat()
 
-    for scan in ordered_scans:
-        seen_in_scan: set[tuple] = set()
-        for row in scan.connections:
-            if row.remote_ip is None or is_loopback_address(row.remote_ip):
-                continue
-            key = _service_key(scan.device_id, row)
-            normalized_remote = key[2]
-            if normalized_remote is None:
-                continue
-            values = connection_dict(row)
-            values["remote_ip"] = normalized_remote
-            bucket = groups.get(key)
-            if bucket is None:
-                bucket = {
-                    **values,
-                    "source_device_id": scan.device_id,
-                    "scan_id": scan.id,
-                    "scan_time": scan.started_at.isoformat(),
-                    "is_current": False,
-                    "first_seen": scan.started_at.isoformat(),
-                    "last_seen": scan.started_at.isoformat(),
-                    "observation_count": 0,
-                    "_scan_ids": set(),
-                    "_local_ips": set(),
-                    "_local_ports": set(),
-                    "_pids": set(),
-                }
-                groups[key] = bucket
-            else:
-                old_hostname = bucket.get("remote_hostname")
-                bucket.update(values)
-                if not bucket.get("remote_hostname"):
-                    bucket["remote_hostname"] = old_hostname
-                bucket["scan_id"] = scan.id
-                bucket["scan_time"] = scan.started_at.isoformat()
-                bucket["last_seen"] = scan.started_at.isoformat()
-
-            bucket["is_current"] = bucket["is_current"] or scan.id in current_ids
-            bucket["_local_ips"].add(values["local_ip"])
-            bucket["_local_ports"].add(values["local_port"])
-            if values["pid"] is not None:
-                bucket["_pids"].add(values["pid"])
-            if key not in seen_in_scan:
-                bucket["_scan_ids"].add(scan.id)
-                seen_in_scan.add(key)
+        bucket["is_current"] = bucket["is_current"] or scan_id in current_ids
+        bucket["_local_ips"].add(values["local_ip"])
+        bucket["_local_ports"].add(values["local_port"])
+        if values["pid"] is not None:
+            bucket["_pids"].add(values["pid"])
+        bucket["_scan_ids"].add(scan_id)
 
     result = []
     for key in sorted(groups, key=str):
@@ -176,6 +174,71 @@ def aggregate_service_connections(
         bucket["observed_pids"] = sorted(bucket.pop("_pids"))
         result.append(bucket)
     return result
+
+
+def aggregate_service_connections(
+    scans: Sequence[ScanRun],
+    current_scan_ids: Collection[int],
+) -> list[dict]:
+    observations = (
+        (scan.id, scan.device_id, scan.started_at, row)
+        for scan in scans
+        for row in scan.connections
+    )
+    return _aggregate_connection_observations(observations, current_scan_ids)
+
+
+def _candidate_connection_ids(
+    scan_conditions,
+    *,
+    source_device_ids: Collection[int] | None = None,
+    inbound_addresses: Collection[str] | None = None,
+):
+    base = (
+        select(ConnectionRecord.id)
+        .join(ScanRun, ScanRun.id == ConnectionRecord.scan_run_id)
+        .where(*scan_conditions, ConnectionRecord.remote_ip.is_not(None))
+    )
+    if source_device_ids is None and inbound_addresses is None:
+        return base
+    sources = sorted(set(source_device_ids or ()))
+    addresses = sorted(set(inbound_addresses or ()))
+    outbound = base.where(ScanRun.device_id.in_(sources))
+    inbound = base.where(ConnectionRecord.remote_ip.in_(addresses))
+    return outbound.union(inbound)
+
+
+def aggregate_current_connections(
+    session: Session,
+    current_scans: dict[int, ScanRun],
+    *,
+    source_device_ids: Collection[int] | None = None,
+    inbound_addresses: Collection[str] | None = None,
+) -> list[dict]:
+    current_ids = {scan.id for scan in current_scans.values()}
+    if not current_ids:
+        return []
+    candidate_ids = _candidate_connection_ids(
+        [ScanRun.id.in_(current_ids)],
+        source_device_ids=source_device_ids,
+        inbound_addresses=inbound_addresses,
+    )
+    connections = session.scalars(
+        select(ConnectionRecord)
+        .where(ConnectionRecord.id.in_(candidate_ids))
+        .order_by(ConnectionRecord.scan_run_id, ConnectionRecord.id)
+    ).all()
+    scans_by_id = {scan.id: scan for scan in current_scans.values()}
+    observations = (
+        (
+            connection.scan_run_id,
+            scans_by_id[connection.scan_run_id].device_id,
+            scans_by_id[connection.scan_run_id].started_at,
+            connection,
+        )
+        for connection in connections
+    )
+    return _aggregate_connection_observations(observations, current_ids)
 
 
 def _csv_int_set(value: str | None) -> set[int]:
