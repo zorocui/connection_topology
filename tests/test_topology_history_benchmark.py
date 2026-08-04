@@ -11,3 +11,6 @@ def test_history_benchmark_smoke(tmp_path):
     assert result["raw_rows"] == 5_000
     assert result["service_groups"] > 0
     assert result["within_target"] is True
+    assert result["scoped_groups"] > 0
+    assert result["scoped_groups"] <= result["service_groups"]
+    assert result["scoped_within_target"] is True

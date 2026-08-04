@@ -160,6 +160,19 @@ def run_benchmark(
             del services
             gc.collect()
 
+            scoped_started_at = time.perf_counter()
+            scoped_services = aggregate_historical_connections(
+                session,
+                devices,
+                current_scan_ids,
+                "1d",
+                now=reference,
+                source_device_ids={devices[0]},
+                inbound_addresses={f"10.10.0.{devices[0]}"},
+            )
+            scoped_seconds = time.perf_counter() - scoped_started_at
+            scoped_groups = len(scoped_services)
+
             tracemalloc.start()
             memory_probe_started_at = time.perf_counter()
             memory_probe_services = aggregate_historical_connections(
@@ -182,6 +195,9 @@ def run_benchmark(
             "memory_probe_seconds": round(memory_probe_seconds, 3),
             "target_seconds": max_seconds,
             "within_target": elapsed_seconds <= max_seconds,
+            "scoped_groups": scoped_groups,
+            "scoped_seconds": round(scoped_seconds, 3),
+            "scoped_within_target": scoped_seconds <= max_seconds,
         }
     finally:
         if engine is not None:
