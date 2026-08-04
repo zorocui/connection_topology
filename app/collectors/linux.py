@@ -1,6 +1,7 @@
 import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import paramiko
 
@@ -16,6 +17,19 @@ from app.collectors.base import (
 SS_WITH_PROCESS = "ss -H -tunap"
 SS_WITHOUT_PROCESS = "ss -H -tuna"
 _PROCESS_RE = re.compile(r'\(\("(?P<name>[^"]+)",pid=(?P<pid>\d+)')
+
+
+@dataclass(frozen=True, slots=True)
+class SkippedSSLine:
+    line_number: int
+    reason: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class SSParseResult:
+    connections: tuple[NormalizedConnection, ...]
+    skipped_lines: tuple[SkippedSSLine, ...]
 
 
 def _parse_endpoint(value: str, *, remote: bool) -> tuple[str | None, int | None]:
@@ -41,27 +55,30 @@ def _parse_endpoint(value: str, *, remote: bool) -> tuple[str | None, int | None
     return host, port
 
 
-def parse_ss_output(output: str) -> tuple[NormalizedConnection, ...]:
+def _parse_ss_output_details(output: str) -> SSParseResult:
     rows: list[NormalizedConnection] = []
+    skipped: list[SkippedSSLine] = []
     for line_number, line in enumerate(output.splitlines(), start=1):
         if not line.strip():
             continue
         parts = line.split(maxsplit=6)
-        if len(parts) < 6:
-            raise CollectorError("parse_error", f"无法解析 ss 第 {line_number} 行")
-        protocol = parts[0].lower()
-        if protocol.startswith("tcp"):
+        protocol_text = parts[0].lower()
+        if protocol_text.startswith("tcp"):
             protocol = "tcp"
-        elif protocol.startswith("udp"):
+        elif protocol_text.startswith("udp"):
             protocol = "udp"
         else:
+            continue
+        if len(parts) < 6:
+            skipped.append(SkippedSSLine(line_number, "字段不足", line))
             continue
         state = parts[1].upper() if protocol == "tcp" else None
         try:
             local_ip, local_port = _parse_endpoint(parts[4], remote=False)
             remote_ip, remote_port = _parse_endpoint(parts[5], remote=True)
-        except (ValueError, IndexError) as exc:
-            raise CollectorError("parse_error", f"无法解析 ss 第 {line_number} 行端点") from exc
+        except (ValueError, IndexError):
+            skipped.append(SkippedSSLine(line_number, "端点无效", line))
+            continue
 
         local_ip = normalize_ip_address(local_ip)
         remote_ip = normalize_ip_address(remote_ip)
@@ -86,7 +103,20 @@ def parse_ss_output(output: str) -> tuple[NormalizedConnection, ...]:
                 process_name=process_name,
             )
         )
-    return tuple(rows)
+    return SSParseResult(tuple(rows), tuple(skipped))
+
+
+def _raise_if_all_candidates_invalid(parsed: SSParseResult) -> None:
+    if parsed.connections or not parsed.skipped_lines:
+        return
+    first = parsed.skipped_lines[0]
+    raise CollectorError("parse_error", f"无法解析 ss 第 {first.line_number} 行")
+
+
+def parse_ss_output(output: str) -> tuple[NormalizedConnection, ...]:
+    parsed = _parse_ss_output_details(output)
+    _raise_if_all_candidates_invalid(parsed)
+    return parsed.connections
 
 
 class LinuxCollector:

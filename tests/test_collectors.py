@@ -81,6 +81,38 @@ def test_parse_ss_tcp_process_and_listener():
     assert ipv6_udp.address_family == "ipv6"
 
 
+def test_parse_ss_keeps_valid_rows_when_tcp_candidate_is_short():
+    rows = parse_ss_output(
+        "tcp BROKEN\n"
+        "tcp ESTAB 0 0 10.0.0.10:50124 10.0.0.20:443"
+    )
+
+    assert len(rows) == 1
+    assert rows[0].remote_port == 443
+
+
+def test_parse_ss_keeps_valid_rows_when_endpoint_is_invalid():
+    rows = parse_ss_output(
+        "udp UNCONN 0 0 invalid-endpoint 10.0.0.20:53\n"
+        "udp UNCONN 0 0 10.0.0.10:5353 10.0.0.20:53"
+    )
+
+    assert len(rows) == 1
+    assert rows[0].local_port == 5353
+
+
+def test_parse_ss_ignores_non_connection_text_and_empty_output():
+    assert parse_ss_output("") == ()
+    assert parse_ss_output("diagnostic text") == ()
+
+
+def test_parse_ss_fails_when_all_tcp_udp_candidates_are_invalid():
+    with pytest.raises(CollectorError, match="无法解析 ss 第 2 行") as captured:
+        parse_ss_output("diagnostic text\nudp BROKEN")
+
+    assert captured.value.code == "parse_error"
+
+
 def test_parse_windows_tcp_and_udp():
     rows = parse_windows_json(
         (FIXTURES / "windows_connections.json").read_text(encoding="utf-8")
