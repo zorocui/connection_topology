@@ -18,9 +18,9 @@ from app.models import (
     ScanTrigger,
 )
 from app.services.scan_queue import (
-    DeviceCollectionDisabled,
     PRIORITY_MANUAL,
     PRIORITY_SCHEDULED,
+    DeviceCollectionDisabled,
     ScanQueueFull,
     ScanQueueService,
 )
