@@ -90,6 +90,7 @@ class ScanService:
                     host=device.host,
                     port=device.port,
                     username=device.username,
+                    device_id=device.id,
                 )
                 result = self.collectors[device.os_type].collect(spec, password)
                 records = [

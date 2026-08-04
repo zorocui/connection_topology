@@ -1,6 +1,6 @@
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlalchemy import text
 from sqlalchemy.exc import TimeoutError as SATimeoutError
@@ -28,8 +28,10 @@ class ImmediateExecutor:
 @dataclass
 class FakeCollector:
     error: Exception | None = None
+    seen_devices: list = field(default_factory=list)
 
     def test_connection(self, device, password):
+        self.seen_devices.append(device)
         if self.error:
             raise self.error
 
@@ -142,6 +144,22 @@ def test_background_import_test_success(app):
         assert batch.status == ImportBatchStatus.COMPLETED
         assert batch.test_success_rows == 1
         assert session.get(Device, device_id) is not None
+
+
+def test_import_test_passes_device_id_to_collector(app):
+    batch_id, _, device_id = seed_pending_row(app, "10.0.0.19")
+    collector = FakeCollector()
+    service = ImportTestService(
+        app.state.session_factory,
+        app.state.cipher,
+        ImmediateExecutor(),
+        collector,
+        FakeCollector(),
+    )
+
+    service.schedule_batch(batch_id)
+
+    assert collector.seen_devices[0].device_id == device_id
 
 
 def test_background_import_test_failure_keeps_device(app):

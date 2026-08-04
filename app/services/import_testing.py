@@ -41,6 +41,7 @@ def _is_transient_database_error(exc: Exception) -> bool:
 
 @dataclass(frozen=True)
 class ImportTestTarget:
+    device_id: int
     os_type: OSType
     host: str
     port: int
@@ -204,6 +205,7 @@ class ImportTestService:
                     None
                     if device is None
                     else ImportTestTarget(
+                        device_id=device.id,
                         os_type=device.os_type,
                         host=device.host,
                         port=device.port,
@@ -242,6 +244,7 @@ class ImportTestService:
                     host=target.host,
                     port=target.port,
                     username=target.username,
+                    device_id=target.device_id,
                 ),
                 password,
             )

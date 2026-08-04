@@ -40,6 +40,7 @@ class DeviceConnectionSpec:
     host: str
     port: int
     username: str
+    device_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
