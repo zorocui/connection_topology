@@ -1,5 +1,5 @@
-from dataclasses import dataclass, field
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 
 from app.models import Device, OSType, ScanTrigger
 from app.services.scan_queue import PRIORITY_SCHEDULED

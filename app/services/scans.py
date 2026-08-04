@@ -193,7 +193,7 @@ class ScanService:
                     error_code=exc.code,
                     error_message=message,
                 )
-            except Exception as exc:  # noqa: BLE001 - worker isolation needs an outcome
+            except Exception as exc:
                 message = safe_error_message(str(exc), (password,))
                 logger.exception(
                     "设备 %s 采集发生内部错误，详情已写入脱敏批次记录",

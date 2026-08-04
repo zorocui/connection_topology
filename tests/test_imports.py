@@ -1,5 +1,5 @@
-from io import BytesIO
 from contextlib import contextmanager
+from io import BytesIO
 
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import select

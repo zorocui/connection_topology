@@ -166,6 +166,7 @@ SCAN_MAX_WORKERS=30
 SCAN_QUEUE_SIZE=2000
 SCAN_JITTER_SECONDS=300
 SQLITE_BUSY_TIMEOUT_MS=30000
+SQLITE_WRITE_RETRY_DELAYS=0.1,0.3,0.8,1.5,3
 DB_POOL_SIZE=20
 DB_MAX_OVERFLOW=10
 DB_POOL_TIMEOUT_SECONDS=60
@@ -176,16 +177,19 @@ DB_POOL_TIMEOUT_SECONDS=60
 - `SCAN_QUEUE_SIZE`：等待或执行中的不同设备任务总上限。
 - `SCAN_JITTER_SECONDS`：定时任务的最大随机错峰秒数。
 - `SQLITE_BUSY_TIMEOUT_MS`：SQLite 并发写入等待时间。
+- `SQLITE_WRITE_RETRY_DELAYS`：SQLite 写冲突后的退避重试秒数。
 - `DB_POOL_SIZE`：数据库常驻连接数，默认 20。
 - `DB_MAX_OVERFLOW`：连接池繁忙时允许的临时额外连接数，默认 10。
 - `DB_POOL_TIMEOUT_SECONDS`：获取数据库连接的最长等待秒数，默认 60。
 
-导入连接测试读取设备参数后会释放数据库会话，SSH/WinRM 网络等待不会占用
-连接池。默认 20 + 10 的连接容量用于页面请求和短时结果写入。SQLite 部署仍
-必须只运行一个 Uvicorn 进程；增加连接池不代表可以启用多个 Web workers。
+导入连接测试和设备扫描读取参数后会释放数据库会话，SSH/WinRM 网络等待不会占用
+连接池。`SCAN_MAX_WORKERS=30` 提供 30 路远程并行采集；采集结果的 SQLite 写入
+只会短暂排队，不会降低远程连接并发。
 
-部署时只运行一个 Uvicorn 进程，不要使用 `--workers`。多个 Web 进程会各自启动
-调度器和扫描协调器，不适用于当前 SQLite 单机队列架构：
+SQLite 模式必须只运行一个 Uvicorn 进程，应用会在启动时对数据库文件加进程锁并
+强制检查。不要使用 `uvicorn --workers`；增加连接池或 Web 进程不会加快远程采集，
+反而会重复启动调度器。写入发生短暂锁冲突时，会按照
+`SQLITE_WRITE_RETRY_DELAYS=0.1,0.3,0.8,1.5,3` 使用新事务重试：
 
 ```bash
 ./.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000

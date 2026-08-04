@@ -103,7 +103,9 @@ def test_write_and_write_once_share_one_reentrant_lock(app):
 
 def test_write_once_converts_transient_error_to_database_busy(app):
     coordinator = SQLiteWriteCoordinator(app.state.session_factory, (0.0,))
-    with pytest.raises(DatabaseBusy) as captured:
-        with coordinator.write_once("api_update_device"):
-            raise locked_error("database is busy")
+    with (
+        pytest.raises(DatabaseBusy) as captured,
+        coordinator.write_once("api_update_device"),
+    ):
+        raise locked_error("database is busy")
     assert captured.value.operation_name == "api_update_device"

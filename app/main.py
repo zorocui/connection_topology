@@ -45,17 +45,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         sqlite_process_guard.acquire()
         try:
             init_database(engine)
-            with sqlite_write_coordinator.write_once("initialize_settings"):
-                with session_factory() as session:
-                    setting = session.get(SystemSetting, 1)
-                    if setting is None:
-                        session.add(
-                            SystemSetting(
-                                id=1,
-                                history_retention_days=resolved.history_retention_days,
-                            )
+            with (
+                sqlite_write_coordinator.write_once("initialize_settings"),
+                session_factory() as session,
+            ):
+                setting = session.get(SystemSetting, 1)
+                if setting is None:
+                    session.add(
+                        SystemSetting(
+                            id=1,
+                            history_retention_days=resolved.history_retention_days,
                         )
-                        session.commit()
+                    )
+                    session.commit()
             app.state.scan_queue.start()
             if app.state.scheduler:
                 app.state.scheduler.start()

@@ -81,13 +81,15 @@ class SchedulerService:
             logger.info("设备 %s 仅用于集群标注，跳过定时采集", device_id)
 
     def _purge_history(self) -> None:
-        with self.write_coordinator.write_once("purge_history"):
-            with self.session_factory() as session:
-                setting = session.get(SystemSetting, 1)
-                purge_expired_scans(
-                    session,
-                    setting.history_retention_days if setting else 7,
-                )
+        with (
+            self.write_coordinator.write_once("purge_history"),
+            self.session_factory() as session,
+        ):
+            setting = session.get(SystemSetting, 1)
+            purge_expired_scans(
+                session,
+                setting.history_retention_days if setting else 7,
+            )
         if self.on_history_purged is not None:
             self.on_history_purged()
 
