@@ -1,5 +1,23 @@
 import time
 
+from app.collectors.base import CollectorError
+from app.models import Device, OSType
+
+
+def seed_marker_device(app, *, host):
+    with app.state.session_factory() as session:
+        marker = Device(
+            name="marker",
+            host=host,
+            os_type=OSType.LINUX,
+            port=22,
+            username="ops",
+            encrypted_password=app.state.cipher.encrypt(""),
+            collection_enabled=False,
+        )
+        session.add(marker)
+        session.commit()
+        return marker.id
 
 def test_device_workflow_never_returns_password(client, linux_device_payload):
     response = client.post("/api/devices", json=linux_device_payload)
@@ -14,6 +32,47 @@ def test_device_workflow_never_returns_password(client, linux_device_payload):
     assert listed[0]["name"] == "生产 Web 01"
     assert "encrypted_password" not in listed[0]
     assert listed[0]["collection_enabled"] is True
+
+
+def test_valid_password_update_enables_marker_collection(client, app):
+    marker_id = seed_marker_device(app, host="10.0.2.10")
+    response = client.put(
+        f"/api/devices/{marker_id}",
+        json={"password": "working-password"},
+    )
+    assert response.status_code == 200
+    assert response.json()["collection_enabled"] is True
+    with app.state.session_factory() as session:
+        device = session.get(Device, marker_id)
+        assert device.collection_enabled is True
+        assert app.state.cipher.decrypt(device.encrypted_password) == "working-password"
+
+
+def test_failed_password_update_leaves_marker_disabled(client, app):
+    marker_id = seed_marker_device(app, host="10.0.2.11")
+    app.state.linux_collector.fail = CollectorError(
+        "authentication_failed",
+        "认证失败",
+    )
+    response = client.put(
+        f"/api/devices/{marker_id}",
+        json={"password": "bad-password"},
+    )
+    assert response.status_code == 502
+    with app.state.session_factory() as session:
+        device = session.get(Device, marker_id)
+        assert device.collection_enabled is False
+        assert app.state.cipher.decrypt(device.encrypted_password) == ""
+
+
+def test_metadata_update_does_not_enable_marker(client, app):
+    marker_id = seed_marker_device(app, host="10.0.2.12")
+    response = client.put(
+        f"/api/devices/{marker_id}",
+        json={"name": "renamed-marker"},
+    )
+    assert response.status_code == 200
+    assert response.json()["collection_enabled"] is False
 
 
 def test_scan_and_topology_workflow(client, linux_device_payload):

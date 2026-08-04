@@ -465,6 +465,7 @@ def update_device(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
     if password:
         device.encrypted_password = request.app.state.cipher.encrypt(password)
+        device.collection_enabled = True
     try:
         db.commit()
     except IntegrityError as exc:
