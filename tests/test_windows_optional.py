@@ -74,13 +74,15 @@ def test_windows_scan_is_recorded_as_failed_without_component(monkeypatch, app):
         session.commit()
         session.refresh(device)
 
-        run = ScanService(
-            session,
-            app.state.cipher,
-            linux_collector=app.state.linux_collector,
-            windows_collector=unavailable_collector(monkeypatch),
-        ).run(device.id, ScanTrigger.MANUAL)
+        device_id = device.id
 
-        assert run.status == ScanStatus.FAILED
-        assert run.error_code == WINDOWS_COMPONENT_ERROR_CODE
-        assert run.error_message == WINDOWS_COMPONENT_ERROR_MESSAGE
+    outcome = ScanService(
+        app.state.session_factory,
+        app.state.cipher,
+        linux_collector=app.state.linux_collector,
+        windows_collector=unavailable_collector(monkeypatch),
+    ).collect(device_id, ScanTrigger.MANUAL)
+
+    assert outcome.status == ScanStatus.FAILED
+    assert outcome.error_code == WINDOWS_COMPONENT_ERROR_CODE
+    assert outcome.error_message == WINDOWS_COMPONENT_ERROR_MESSAGE

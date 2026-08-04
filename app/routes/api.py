@@ -324,7 +324,7 @@ def remove_cluster(
 
 def _scan_service(request: Request, db: Session) -> ScanService:
     return ScanService(
-        db,
+        request.app.state.session_factory,
         request.app.state.cipher,
         request.app.state.linux_collector,
         request.app.state.windows_collector,

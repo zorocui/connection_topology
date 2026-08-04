@@ -25,7 +25,8 @@ from app.models import (
     ScanTrigger,
 )
 from app.security import CredentialCipher
-from app.services.scans import ScanService
+from app.services.scans import ScanService, add_scan_outcome
+from app.services.sqlite_writes import SQLiteWriteCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ class ScanQueueService:
         cipher: CredentialCipher,
         linux_collector: Collector,
         windows_collector: Collector,
+        write_coordinator: SQLiteWriteCoordinator,
         *,
         max_workers: int,
         queue_size: int,
@@ -68,6 +70,13 @@ class ScanQueueService:
         self.cipher = cipher
         self.linux_collector = linux_collector
         self.windows_collector = windows_collector
+        self.write_coordinator = write_coordinator
+        self.scan_service = ScanService(
+            session_factory,
+            cipher,
+            linux_collector,
+            windows_collector,
+        )
         self.max_workers = max_workers
         self.queue_size = queue_size
         self.on_successful_scan = on_successful_scan
@@ -359,29 +368,28 @@ class ScanQueueService:
         return task_ids[0] if task_ids else None
 
     def _execute_task(self, task_id: int) -> None:
-        successful = False
         with self.session_factory() as session:
             task = session.get(ScanTask, task_id)
             if task is None or task.status != ScanTaskStatus.RUNNING:
                 return
-            run = ScanService(
-                session,
-                self.cipher,
-                self.linux_collector,
-                self.windows_collector,
-            ).run(task.device_id, task.trigger_type)
+            device_id = task.device_id
+            trigger = task.trigger_type
+
+        outcome = self.scan_service.collect(device_id, trigger)
+
+        def persist(session: Session) -> bool:
             task = session.get(ScanTask, task_id)
-            if task is None:
-                return
+            if task is None or task.status != ScanTaskStatus.RUNNING:
+                return False
+            run = add_scan_outcome(session, outcome)
             task.scan_run_id = run.id
-            task.finished_at = datetime.now(timezone.utc)
-            task.error_message = run.error_message
+            task.finished_at = outcome.finished_at
+            task.error_message = outcome.error_message
             task.status = (
                 ScanTaskStatus.SUCCESS
-                if run.status == ScanStatus.SUCCESS
+                if outcome.status == ScanStatus.SUCCESS
                 else ScanTaskStatus.FAILED
             )
-            successful = task.status == ScanTaskStatus.SUCCESS
             batch_ids: set[int] = set()
             for item in task.items:
                 item.status = task.status
@@ -389,7 +397,9 @@ class ScanQueueService:
             session.flush()
             for batch_id in batch_ids:
                 self._refresh_batch(session, batch_id)
-            session.commit()
+            return task.status == ScanTaskStatus.SUCCESS
+
+        successful = self.write_coordinator.write("persist_scan", persist)
         if successful and self.on_successful_scan:
             try:
                 self.on_successful_scan()

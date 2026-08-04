@@ -15,6 +15,7 @@ from app.services.import_testing import ImportTestService
 from app.services.process_guard import SQLiteProcessGuard, sqlite_database_path
 from app.services.scan_queue import ScanQueueService
 from app.services.scheduler import SchedulerService
+from app.services.sqlite_writes import SQLiteWriteCoordinator
 from app.services.topology import HostAddressResolver
 from app.services.topology_cache import TopologyCache
 
@@ -30,6 +31,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     session_factory = create_session_factory(engine)
     cipher = CredentialCipher(resolved.app_secret_key)
+    sqlite_write_coordinator = SQLiteWriteCoordinator(
+        session_factory,
+        resolved.sqlite_write_retry_delays,
+        enabled=engine.dialect.name == "sqlite",
+    )
     sqlite_process_guard = SQLiteProcessGuard(
         sqlite_database_path(resolved.database_url)
     )
@@ -75,6 +81,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.session_factory = session_factory
     app.state.cipher = cipher
     app.state.sqlite_process_guard = sqlite_process_guard
+    app.state.sqlite_write_coordinator = sqlite_write_coordinator
     app.state.address_resolver = HostAddressResolver()
     app.state.linux_collector = LinuxCollector(resolved.remote_timeout_seconds)
     app.state.windows_collector = WindowsCollector(resolved.remote_timeout_seconds)
@@ -88,6 +95,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         cipher,
         app.state.linux_collector,
         app.state.windows_collector,
+        sqlite_write_coordinator,
         max_workers=resolved.scan_max_workers,
         queue_size=resolved.scan_queue_size,
         on_successful_scan=app.state.topology_cache.clear,

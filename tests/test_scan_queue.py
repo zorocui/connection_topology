@@ -13,6 +13,8 @@ from app.models import (
     ScanBatchItem,
     ScanBatchStatus,
     ScanBatchType,
+    ScanRun,
+    ScanStatus,
     ScanTask,
     ScanTaskStatus,
     ScanTrigger,
@@ -38,6 +40,7 @@ def make_queue(
         app.state.cipher,
         app.state.linux_collector,
         app.state.windows_collector,
+        app.state.sqlite_write_coordinator,
         max_workers=max_workers,
         queue_size=queue_size,
         on_successful_scan=on_successful_scan,
@@ -60,6 +63,30 @@ def seed_devices(app, count):
         session.add_all(devices)
         session.commit()
         return [device.id for device in devices]
+
+
+def test_execute_persists_run_device_task_items_and_batch_atomically(app):
+    device_id = seed_devices(app, 1)[0]
+    queue = make_queue(app)
+    batch = queue.create_batch(ScanBatchType.ALL, [device_id])
+    task_id = queue._claim_next_task()
+
+    queue._execute_task(task_id)
+
+    with app.state.session_factory() as session:
+        task = session.get(ScanTask, task_id)
+        run = session.get(ScanRun, task.scan_run_id)
+        item = session.scalar(
+            select(ScanBatchItem).where(ScanBatchItem.batch_id == batch.id)
+        )
+        persisted_batch = session.get(ScanBatch, batch.id)
+        device = session.get(Device, device_id)
+        assert task.status == ScanTaskStatus.SUCCESS
+        assert run.status == ScanStatus.SUCCESS
+        assert device.last_scan_status == ScanStatus.SUCCESS
+        assert item.status == ScanTaskStatus.SUCCESS
+        assert persisted_batch.success_tasks == 1
+        assert persisted_batch.status == ScanBatchStatus.COMPLETED
 
 
 def seed_marker(app):
@@ -219,6 +246,7 @@ def test_worker_pool_reaches_configured_network_concurrency(app):
         app.state.cipher,
         collector,
         collector,
+        app.state.sqlite_write_coordinator,
         max_workers=30,
         queue_size=100,
     )

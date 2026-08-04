@@ -12,6 +12,7 @@ from app.collectors.base import CollectionResult, NormalizedConnection
 from app.config import Settings
 from app.database import init_database
 from app.main import create_app
+from app.models import OSType
 
 
 @pytest.fixture
@@ -77,6 +78,12 @@ def app(tmp_path, valid_key):
     application.state.windows_collector = FakeCollector()
     application.state.scan_queue.linux_collector = application.state.linux_collector
     application.state.scan_queue.windows_collector = application.state.windows_collector
+    application.state.scan_queue.scan_service.collectors[OSType.LINUX] = (
+        application.state.linux_collector
+    )
+    application.state.scan_queue.scan_service.collectors[OSType.WINDOWS] = (
+        application.state.windows_collector
+    )
     return application
 
 
