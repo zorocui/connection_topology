@@ -5,8 +5,8 @@ from sqlalchemy import select
 
 from app.collectors.base import CollectionResult, DeviceConnectionSpec
 from app.models import Device, OSType, ScanRun, ScanStatus, ScanTrigger
-from app.services.scheduler import purge_expired_scans
 from app.services.scans import ScanService
+from app.services.scheduler import purge_expired_scans
 
 
 @dataclass

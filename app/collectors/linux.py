@@ -1,3 +1,4 @@
+import logging
 import re
 import time
 from collections.abc import Callable
@@ -13,6 +14,8 @@ from app.collectors.base import (
     address_family,
     normalize_ip_address,
 )
+
+logger = logging.getLogger(__name__)
 
 SS_WITH_PROCESS = "ss -H -tunap"
 SS_WITHOUT_PROCESS = "ss -H -tuna"
@@ -113,6 +116,18 @@ def _raise_if_all_candidates_invalid(parsed: SSParseResult) -> None:
     raise CollectorError("parse_error", f"无法解析 ss 第 {first.line_number} 行")
 
 
+def _log_skipped_lines(device: DeviceConnectionSpec, parsed: SSParseResult) -> None:
+    device_label = device.device_id if device.device_id is not None else "unknown"
+    for skipped in parsed.skipped_lines:
+        logger.warning(
+            "设备 %s 跳过无法解析的 ss 第 %s 行 reason=%s raw=%r",
+            device_label,
+            skipped.line_number,
+            skipped.reason,
+            skipped.content,
+        )
+
+
 def parse_ss_output(output: str) -> tuple[NormalizedConnection, ...]:
     parsed = _parse_ss_output_details(output)
     _raise_if_all_candidates_invalid(parsed)
@@ -205,13 +220,23 @@ class LinuxCollector:
         client = self._connect(device, password)
         try:
             code, output, error = self._execute(client, SS_WITH_PROCESS)
-            warning = None
+            warnings: list[str] = []
             if code != 0:
                 fallback_code, output, fallback_error = self._execute(client, SS_WITHOUT_PROCESS)
                 if fallback_code != 0:
                     detail = fallback_error.strip() or error.strip() or "服务器未安装 ss"
                     raise CollectorError("command_unavailable", detail)
-                warning = "当前账户无法读取完整进程信息，已降级采集网络连接"
-            return CollectionResult(parse_ss_output(output), warning)
+                warnings.append("当前账户无法读取完整进程信息，已降级采集网络连接")
+            parsed = _parse_ss_output_details(output)
+            _log_skipped_lines(device, parsed)
+            _raise_if_all_candidates_invalid(parsed)
+            if parsed.skipped_lines:
+                warnings.append(
+                    f"已跳过 {len(parsed.skipped_lines)} 条无法解析的 ss 记录"
+                )
+            return CollectionResult(
+                parsed.connections,
+                "；".join(warnings) if warnings else None,
+            )
         finally:
             client.close()

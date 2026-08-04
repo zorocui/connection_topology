@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from app.collectors import linux as linux_module
-from app.collectors.base import CollectorError
+from app.collectors.base import CollectorError, DeviceConnectionSpec
 from app.collectors.linux import LinuxCollector, parse_ss_output
 from app.collectors.windows import parse_windows_json
 
@@ -68,6 +68,26 @@ class FakeSSHClient:
         assert timeout > 0
         stream = FakeStream(self.channel)
         return None, stream, stream
+
+
+class ClosingClient:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def stub_linux_collection(monkeypatch, collector, responses):
+    client = ClosingClient()
+    response_iter = iter(responses)
+    monkeypatch.setattr(collector, "_connect", lambda device, password: client)
+    monkeypatch.setattr(
+        collector,
+        "_execute",
+        lambda connected_client, command: next(response_iter),
+    )
+    return client
 
 
 def test_parse_ss_tcp_process_and_listener():
@@ -178,3 +198,68 @@ def test_linux_execute_closes_channel_on_total_timeout(monkeypatch):
     assert captured.value.code == "command_timeout"
     assert str(captured.value) == "远程 ss 命令执行超时"
     assert channel.closed is True
+
+
+def test_linux_collect_logs_raw_skipped_line_and_returns_warning(monkeypatch, caplog):
+    collector = LinuxCollector()
+    malformed = "tcp BROKEN"
+    client = stub_linux_collection(
+        monkeypatch,
+        collector,
+        [(0, f"{malformed}\ntcp ESTAB 0 0 10.0.0.10:22 10.0.0.20:443", "")],
+    )
+
+    with caplog.at_level("WARNING", logger="app.collectors.linux"):
+        result = collector.collect(
+            DeviceConnectionSpec("10.0.0.10", 22, "ops", device_id=42),
+            "secret",
+        )
+
+    assert len(result.connections) == 1
+    assert result.warning == "已跳过 1 条无法解析的 ss 记录"
+    assert "设备 42" in caplog.text
+    assert "ss 第 1 行" in caplog.text
+    assert "字段不足" in caplog.text
+    assert repr(malformed) in caplog.text
+    assert client.closed is True
+
+
+def test_linux_collect_merges_fallback_and_parse_warnings(monkeypatch, caplog):
+    collector = LinuxCollector()
+    stub_linux_collection(
+        monkeypatch,
+        collector,
+        [
+            (1, "", "permission denied"),
+            (0, "udp BROKEN\nudp UNCONN 0 0 10.0.0.10:53 10.0.0.20:53", ""),
+        ],
+    )
+
+    with caplog.at_level("WARNING", logger="app.collectors.linux"):
+        result = collector.collect(
+            DeviceConnectionSpec("10.0.0.10", 22, "ops"),
+            "secret",
+        )
+
+    assert result.warning == (
+        "当前账户无法读取完整进程信息，已降级采集网络连接；"
+        "已跳过 1 条无法解析的 ss 记录"
+    )
+    assert "设备 unknown" in caplog.text
+
+
+def test_linux_collect_logs_before_failing_all_invalid_output(monkeypatch, caplog):
+    collector = LinuxCollector()
+    stub_linux_collection(monkeypatch, collector, [(0, "udp BROKEN", "")])
+
+    with (
+        caplog.at_level("WARNING", logger="app.collectors.linux"),
+        pytest.raises(CollectorError, match="无法解析 ss 第 1 行"),
+    ):
+        collector.collect(
+            DeviceConnectionSpec("10.0.0.10", 22, "ops", device_id=7),
+            "secret",
+        )
+
+    assert "设备 7" in caplog.text
+    assert repr("udp BROKEN") in caplog.text
