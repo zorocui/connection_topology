@@ -488,3 +488,28 @@ def test_sql_history_filters_candidates_and_ignores_loopback(app):
             (selected.id, "203.0.113.8"),
             (inbound.id, selected.host),
         }
+
+
+def test_sql_history_union_deduplicates_connection_matching_both_paths(app):
+    with app.state.session_factory() as session:
+        selected = add_device(session, app, "selected-overlap", "10.0.0.50")
+        current = add_scan(
+            session,
+            selected,
+            started_at=NOW,
+            remote_ip=selected.host,
+        )
+        session.commit()
+
+        rows = aggregate_historical_connections(
+            session,
+            [selected.id],
+            {current.id},
+            "1d",
+            now=NOW,
+            source_device_ids={selected.id},
+            inbound_addresses={selected.host},
+        )
+
+        assert len(rows) == 1
+        assert rows[0]["observation_count"] == 1

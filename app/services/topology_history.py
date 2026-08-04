@@ -280,15 +280,11 @@ def aggregate_historical_connections(
         ),
         ConnectionRecord.remote_ip.is_not(None),
     ]
-    if source_device_ids is not None or inbound_addresses is not None:
-        sources = sorted(set(source_device_ids or ()))
-        addresses = sorted(set(inbound_addresses or ()))
-        conditions.append(
-            or_(
-                ScanRun.device_id.in_(sources),
-                ConnectionRecord.remote_ip.in_(addresses),
-            )
-        )
+    candidate_ids = _candidate_connection_ids(
+        conditions,
+        source_device_ids=source_device_ids,
+        inbound_addresses=inbound_addresses,
+    )
 
     eligible = (
         select(
@@ -309,7 +305,7 @@ def aggregate_historical_connections(
             process_key,
         )
         .join(ScanRun, ScanRun.id == ConnectionRecord.scan_run_id)
-        .where(*conditions)
+        .where(ConnectionRecord.id.in_(candidate_ids))
         .subquery()
     )
     raw_key = (
