@@ -1,11 +1,12 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+import pytest
+from sqlalchemy import func, select
 
 from app.collectors.base import CollectionResult, DeviceConnectionSpec
 from app.models import Device, OSType, ScanRun, ScanStatus, ScanTrigger
-from app.services.scans import ScanService
+from app.services.scans import CollectionDisabled, ScanService
 from app.services.scheduler import purge_expired_scans
 
 
@@ -75,3 +76,33 @@ def test_scan_service_passes_device_id_to_collector(app):
         service.run(device_id, ScanTrigger.MANUAL)
 
     assert collector.seen_devices[0].device_id == device_id
+
+
+def test_scan_service_refuses_marker_before_collector(app):
+    collector = RecordingCollector()
+    with app.state.session_factory() as session:
+        marker = Device(
+            name="marker",
+            host="10.0.0.91",
+            os_type=OSType.LINUX,
+            port=22,
+            username="ops",
+            encrypted_password=app.state.cipher.encrypt(""),
+            collection_enabled=False,
+        )
+        session.add(marker)
+        session.commit()
+        marker_id = marker.id
+        with pytest.raises(CollectionDisabled, match="仅用于集群标注"):
+            ScanService(
+                session,
+                app.state.cipher,
+                linux_collector=collector,
+                windows_collector=collector,
+            ).run(marker_id, ScanTrigger.MANUAL)
+        assert session.scalar(
+            select(func.count()).select_from(ScanRun).where(
+                ScanRun.device_id == marker_id
+            )
+        ) == 0
+    assert collector.seen_devices == []

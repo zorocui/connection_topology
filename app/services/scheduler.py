@@ -9,7 +9,12 @@ from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from app.models import Device, ScanRun, ScanTrigger, SystemSetting
 from app.services.retention import resolve_device_retention
-from app.services.scan_queue import PRIORITY_SCHEDULED, ScanQueueFull, ScanQueueService
+from app.services.scan_queue import (
+    PRIORITY_SCHEDULED,
+    DeviceCollectionDisabled,
+    ScanQueueFull,
+    ScanQueueService,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +71,8 @@ class SchedulerService:
             )
         except ScanQueueFull:
             logger.warning("扫描队列已满，跳过设备 %s 的本次定时任务", device_id)
+        except DeviceCollectionDisabled:
+            logger.info("设备 %s 仅用于集群标注，跳过定时采集", device_id)
 
     def _purge_history(self) -> None:
         with self.session_factory() as session:
@@ -79,7 +86,7 @@ class SchedulerService:
 
     def sync_device(self, device: Device) -> None:
         job_id = f"device-scan-{device.id}"
-        if not device.scheduled_enabled:
+        if device.collection_enabled is False or not device.scheduled_enabled:
             if self.scheduler.get_job(job_id):
                 self.scheduler.remove_job(job_id)
             return
@@ -114,7 +121,12 @@ class SchedulerService:
         )
         self.scheduler.start()
         with self.session_factory() as session:
-            devices = session.scalars(select(Device).where(Device.scheduled_enabled.is_(True))).all()
+            devices = session.scalars(
+                select(Device).where(
+                    Device.scheduled_enabled.is_(True),
+                    Device.collection_enabled.is_(True),
+                )
+            ).all()
             for device in devices:
                 self.sync_device(device)
 

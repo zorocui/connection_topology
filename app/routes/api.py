@@ -65,7 +65,12 @@ from app.services.scan_batch_failures import (
     failed_device_ids,
     list_batch_failures,
 )
-from app.services.scan_queue import PRIORITY_MANUAL, ScanQueueFull
+from app.services.scan_queue import (
+    COLLECTION_DISABLED_MESSAGE,
+    PRIORITY_MANUAL,
+    DeviceCollectionDisabled,
+    ScanQueueFull,
+)
 from app.services.scans import ScanService
 from app.services.topology import build_cluster_topology, build_topology, diff_scans
 from app.services.topology_history import (
@@ -492,14 +497,19 @@ def delete_device(device_id: int, request: Request, db: Session = Depends(get_db
     status_code=status.HTTP_202_ACCEPTED,
 )
 def run_scan(device_id: int, request: Request, db: Session = Depends(get_db)):
-    if db.get(Device, device_id) is None:
+    device = db.get(Device, device_id)
+    if device is None:
         raise HTTPException(status_code=404, detail="设备不存在")
+    if not device.collection_enabled:
+        raise HTTPException(status_code=409, detail=COLLECTION_DISABLED_MESSAGE)
     try:
         return request.app.state.scan_queue.enqueue_device(
             device_id,
             ScanTrigger.MANUAL,
             PRIORITY_MANUAL,
         )
+    except DeviceCollectionDisabled as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ScanQueueFull as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
 
@@ -523,7 +533,7 @@ def create_scan_batch(
     db: Session = Depends(get_db),
 ):
     cluster_id = None
-    statement = select(Device.id)
+    statement = select(Device.id).where(Device.collection_enabled.is_(True))
     batch_type = ScanBatchType.ALL
     if payload.scope == "cluster":
         cluster = db.get(Cluster, payload.cluster_id)

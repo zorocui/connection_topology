@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from sqlalchemy import func, select
 
 from app.models import (
+    Cluster,
     Device,
     OSType,
     ScanBatch,
@@ -19,6 +20,69 @@ from app.models import (
 def create_device(client, payload, *, host, name, cluster_id=None):
     body = {**payload, "host": host, "name": name, "cluster_id": cluster_id}
     return client.post("/api/devices", json=body).json()
+
+
+def seed_marker_device(app, *, host, cluster=None):
+    with app.state.session_factory() as session:
+        marker = Device(
+            name="marker",
+            host=host,
+            os_type=OSType.LINUX,
+            port=22,
+            username="marker-ops",
+            encrypted_password=app.state.cipher.encrypt(""),
+            collection_enabled=False,
+            cluster_id=cluster,
+        )
+        session.add(marker)
+        session.commit()
+        return marker.id
+
+
+def seed_collectible_and_marker_cluster(app):
+    with app.state.session_factory() as session:
+        cluster = Cluster(name="scan-gated-cluster")
+        normal = Device(
+            name="normal",
+            host="10.0.1.91",
+            os_type=OSType.LINUX,
+            port=22,
+            username="normal-ops",
+            encrypted_password=app.state.cipher.encrypt("secret"),
+            cluster=cluster,
+        )
+        marker = Device(
+            name="marker",
+            host="10.0.1.92",
+            os_type=OSType.LINUX,
+            port=22,
+            username="marker-ops",
+            encrypted_password=app.state.cipher.encrypt(""),
+            collection_enabled=False,
+            cluster=cluster,
+        )
+        session.add_all([normal, marker])
+        session.commit()
+        return cluster.id, normal.id, marker.id
+
+
+def test_marker_manual_scan_returns_conflict(client, app):
+    marker_id = seed_marker_device(app, host="10.0.1.90")
+    response = client.post(f"/api/devices/{marker_id}/scan")
+    assert response.status_code == 409
+    assert response.json()["detail"] == "该设备仅用于集群标注，未配置采集凭据"
+
+
+def test_all_and_cluster_batches_exclude_markers(client, app):
+    cluster_id, normal_id, marker_id = seed_collectible_and_marker_cluster(app)
+    all_batch = client.post("/api/scan-batches", json={"scope": "all"}).json()
+    cluster_batch = client.post(
+        "/api/scan-batches",
+        json={"scope": "cluster", "cluster_id": cluster_id},
+    ).json()
+    assert all_batch["total_tasks"] == 1
+    assert cluster_batch["total_tasks"] == 1
+    assert normal_id != marker_id
 
 
 def wait_for_task(client, task_id):

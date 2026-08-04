@@ -45,6 +45,13 @@ class ScanQueueFull(RuntimeError):
     pass
 
 
+COLLECTION_DISABLED_MESSAGE = "该设备仅用于集群标注，未配置采集凭据"
+
+
+class DeviceCollectionDisabled(RuntimeError):
+    pass
+
+
 class ScanQueueService:
     def __init__(
         self,
@@ -121,8 +128,11 @@ class ScanQueueService:
         priority: int,
         batch_id: int | None = None,
     ) -> ScanTask:
-        if session.get(Device, device_id) is None:
+        device = session.get(Device, device_id)
+        if device is None:
             raise ValueError("设备不存在")
+        if not device.collection_enabled:
+            raise DeviceCollectionDisabled(COLLECTION_DISABLED_MESSAGE)
         task = self._active_task(session, device_id)
         if task is None:
             if self._active_count(session) >= self.queue_size:
@@ -183,7 +193,12 @@ class ScanQueueService:
     ) -> ScanBatch:
         unique_ids = list(dict.fromkeys(device_ids))
         existing_devices = set(
-            session.scalars(select(Device.id).where(Device.id.in_(unique_ids))).all()
+            session.scalars(
+                select(Device.id).where(
+                    Device.id.in_(unique_ids),
+                    Device.collection_enabled.is_(True),
+                )
+            ).all()
         )
         selected_ids = [device_id for device_id in unique_ids if device_id in existing_devices]
         active_device_ids = set(

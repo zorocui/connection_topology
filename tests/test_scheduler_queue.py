@@ -38,3 +38,22 @@ def test_scheduled_job_uses_configured_jitter(app):
     job = scheduler.scheduler.get_job("device-scan-99")
     assert job is not None
     assert job.trigger.jitter == 123
+
+
+def test_marker_device_has_no_scheduled_job(app):
+    queue = RecordingQueue()
+    scheduler = SchedulerService(app.state.session_factory, queue, 123)
+    device = Device(
+        id=100,
+        name="marker",
+        host="10.0.0.100",
+        os_type=OSType.LINUX,
+        port=22,
+        username="ops",
+        encrypted_password="unused",
+        scan_interval_minutes=5,
+        scheduled_enabled=True,
+        collection_enabled=False,
+    )
+    scheduler.sync_device(device)
+    assert scheduler.scheduler.get_job("device-scan-100") is None

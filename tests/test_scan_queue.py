@@ -18,6 +18,7 @@ from app.models import (
     ScanTrigger,
 )
 from app.services.scan_queue import (
+    DeviceCollectionDisabled,
     PRIORITY_MANUAL,
     PRIORITY_SCHEDULED,
     ScanQueueFull,
@@ -59,6 +60,39 @@ def seed_devices(app, count):
         session.add_all(devices)
         session.commit()
         return [device.id for device in devices]
+
+
+def seed_marker(app):
+    with app.state.session_factory() as session:
+        marker = Device(
+            name="marker",
+            host="10.0.9.90",
+            os_type=OSType.LINUX,
+            port=22,
+            username="ops",
+            encrypted_password=app.state.cipher.encrypt(""),
+            collection_enabled=False,
+        )
+        session.add(marker)
+        session.commit()
+        return marker.id
+
+
+def test_marker_cannot_be_enqueued_directly(app):
+    marker_id = seed_marker(app)
+    queue = make_queue(app)
+    with pytest.raises(DeviceCollectionDisabled, match="仅用于集群标注"):
+        queue.enqueue_device(marker_id, ScanTrigger.MANUAL, PRIORITY_MANUAL)
+
+
+def test_batch_excludes_marker_device(app):
+    normal_id = seed_devices(app, 1)[0]
+    marker_id = seed_marker(app)
+    queue = make_queue(app)
+    batch = queue.create_batch(ScanBatchType.ALL, [normal_id, marker_id])
+    with app.state.session_factory() as session:
+        persisted = session.get(ScanBatch, batch.id)
+        assert [item.device_id for item in persisted.items] == [normal_id]
 
 
 def test_duplicate_device_reuses_task_and_raises_priority(app):

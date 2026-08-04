@@ -25,6 +25,10 @@ class DeviceNotFound(RuntimeError):
     pass
 
 
+class CollectionDisabled(RuntimeError):
+    pass
+
+
 class ScanService:
     _locks_guard = threading.Lock()
     _locks: ClassVar[defaultdict[int, threading.Lock]] = defaultdict(threading.Lock)
@@ -75,6 +79,8 @@ class ScanService:
             device = self.session.get(Device, device_id)
             if device is None:
                 raise DeviceNotFound(f"设备 {device_id} 不存在")
+            if not device.collection_enabled:
+                raise CollectionDisabled("该设备仅用于集群标注，未配置采集凭据")
             run = ScanRun(
                 device_id=device.id,
                 trigger_type=trigger,
