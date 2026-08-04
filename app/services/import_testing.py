@@ -1,15 +1,10 @@
 import logging
-import threading
-import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TypeVar
 
 from sqlalchemy import func, select
-from sqlalchemy.exc import OperationalError
-from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.collectors.base import Collector, DeviceConnectionSpec
@@ -22,21 +17,9 @@ from app.models import (
     OSType,
 )
 from app.security import CredentialCipher, safe_error_message
+from app.services.sqlite_writes import SQLiteWriteCoordinator
 
 logger = logging.getLogger(__name__)
-T = TypeVar("T")
-DATABASE_RETRY_DELAYS = (0.1, 0.3)
-
-
-def _is_transient_database_error(exc: Exception) -> bool:
-    if isinstance(exc, SATimeoutError):
-        return True
-    if not isinstance(exc, OperationalError):
-        return False
-    message = str(exc).lower()
-    return "database" in message and (
-        "locked" in message or "busy" in message
-    )
 
 
 @dataclass(frozen=True)
@@ -63,6 +46,7 @@ class ImportTestService:
         executor: ThreadPoolExecutor,
         linux_collector: Collector,
         windows_collector: Collector,
+        write_coordinator: SQLiteWriteCoordinator | Callable[[int], None] | None = None,
         batch_completed_callback: Callable[[int], None] | None = None,
     ) -> None:
         self.session_factory = session_factory
@@ -70,87 +54,67 @@ class ImportTestService:
         self.executor = executor
         self.linux_collector = linux_collector
         self.windows_collector = windows_collector
+        if write_coordinator is not None and not isinstance(
+            write_coordinator, SQLiteWriteCoordinator
+        ):
+            batch_completed_callback = write_coordinator
+            write_coordinator = None
+        self.write_coordinator = write_coordinator or SQLiteWriteCoordinator(
+            session_factory,
+            (0.1, 0.3),
+        )
         self.batch_completed_callback = batch_completed_callback
-        self._database_gate = threading.Lock()
-
-    def _run_database_operation(self, operation: Callable[[], T]) -> T:
-        for attempt in range(len(DATABASE_RETRY_DELAYS) + 1):
-            try:
-                with self._database_gate:
-                    return operation()
-            except Exception as exc:
-                if (
-                    not _is_transient_database_error(exc)
-                    or attempt == len(DATABASE_RETRY_DELAYS)
-                ):
-                    raise
-                time.sleep(DATABASE_RETRY_DELAYS[attempt])
-        raise AssertionError("数据库重试循环未返回")
 
     def schedule_batch(self, batch_id: int) -> None:
-        def load_row_ids() -> list[int]:
-            with self.session_factory() as session:
-                return list(
-                    session.scalars(
-                        select(ImportRowResult.id).where(
-                            ImportRowResult.batch_id == batch_id,
-                            ImportRowResult.test_status == ImportTestStatus.PENDING,
-                        )
-                    ).all()
-                )
-
-        row_ids = self._run_database_operation(load_row_ids)
+        with self.session_factory() as session:
+            row_ids = list(
+                session.scalars(
+                    select(ImportRowResult.id).where(
+                        ImportRowResult.batch_id == batch_id,
+                        ImportRowResult.test_status == ImportTestStatus.PENDING,
+                    )
+                ).all()
+            )
         for row_id in row_ids:
             self._submit(row_id)
 
     def resume_pending(self) -> None:
-        def recover_and_load_pending_row_ids() -> list[int]:
-            with self.session_factory() as session:
-                running_rows = list(
-                    session.scalars(
-                        select(ImportRowResult).where(
-                            ImportRowResult.test_status
-                            == ImportTestStatus.RUNNING
-                        )
-                    ).all()
-                )
-                affected_batch_ids = {row.batch_id for row in running_rows}
-                for row in running_rows:
-                    row.test_status = ImportTestStatus.PENDING
-                    row.test_message = None
-                session.flush()
-                for batch_id in affected_batch_ids:
-                    self._refresh_batch_counts(session, batch_id)
-                row_ids = list(
-                    session.scalars(
-                        select(ImportRowResult.id).where(
-                            ImportRowResult.test_status == ImportTestStatus.PENDING
-                        )
-                    ).all()
-                )
-                session.commit()
-                return row_ids
+        def recover(session: Session) -> list[int]:
+            running_rows = list(
+                session.scalars(
+                    select(ImportRowResult).where(
+                        ImportRowResult.test_status == ImportTestStatus.RUNNING
+                    )
+                ).all()
+            )
+            affected_batch_ids = {row.batch_id for row in running_rows}
+            for row in running_rows:
+                row.test_status = ImportTestStatus.PENDING
+                row.test_message = None
+            session.flush()
+            for batch_id in affected_batch_ids:
+                self._refresh_batch_counts(session, batch_id)
+            return list(
+                session.scalars(
+                    select(ImportRowResult.id).where(
+                        ImportRowResult.test_status == ImportTestStatus.PENDING
+                    )
+                ).all()
+            )
 
-        row_ids = self._run_database_operation(
-            recover_and_load_pending_row_ids
-        )
+        row_ids = self.write_coordinator.write("recover_import_tests", recover)
         for row_id in row_ids:
             self._submit(row_id)
         if self.batch_completed_callback:
-            def load_completed_batch_ids() -> list[int]:
-                with self.session_factory() as session:
-                    return list(
-                        session.scalars(
-                            select(ImportBatch.id).where(
-                                ImportBatch.status == ImportBatchStatus.COMPLETED,
-                                ImportBatch.scan_batch_id.is_(None),
-                            )
-                        ).all()
-                    )
-
-            completed_batch_ids = self._run_database_operation(
-                load_completed_batch_ids
-            )
+            with self.session_factory() as session:
+                completed_batch_ids = list(
+                    session.scalars(
+                        select(ImportBatch.id).where(
+                            ImportBatch.status == ImportBatchStatus.COMPLETED,
+                            ImportBatch.scan_batch_id.is_(None),
+                        )
+                    ).all()
+                )
             for batch_id in completed_batch_ids:
                 self.batch_completed_callback(batch_id)
 
@@ -158,30 +122,19 @@ class ImportTestService:
         batch = session.get(ImportBatch, batch_id)
         assert batch is not None
         was_completed = batch.status == ImportBatchStatus.COMPLETED
-        batch.test_pending_rows = session.scalar(
-            select(func.count()).select_from(ImportRowResult).where(
-                ImportRowResult.batch_id == batch_id,
-                ImportRowResult.test_status == ImportTestStatus.PENDING,
-            )
-        ) or 0
-        batch.test_running_rows = session.scalar(
-            select(func.count()).select_from(ImportRowResult).where(
-                ImportRowResult.batch_id == batch_id,
-                ImportRowResult.test_status == ImportTestStatus.RUNNING,
-            )
-        ) or 0
-        batch.test_success_rows = session.scalar(
-            select(func.count()).select_from(ImportRowResult).where(
-                ImportRowResult.batch_id == batch_id,
-                ImportRowResult.test_status == ImportTestStatus.SUCCESS,
-            )
-        ) or 0
-        batch.test_failed_rows = session.scalar(
-            select(func.count()).select_from(ImportRowResult).where(
-                ImportRowResult.batch_id == batch_id,
-                ImportRowResult.test_status == ImportTestStatus.FAILED,
-            )
-        ) or 0
+
+        def count(status: ImportTestStatus) -> int:
+            return session.scalar(
+                select(func.count()).select_from(ImportRowResult).where(
+                    ImportRowResult.batch_id == batch_id,
+                    ImportRowResult.test_status == status,
+                )
+            ) or 0
+
+        batch.test_pending_rows = count(ImportTestStatus.PENDING)
+        batch.test_running_rows = count(ImportTestStatus.RUNNING)
+        batch.test_success_rows = count(ImportTestStatus.SUCCESS)
+        batch.test_failed_rows = count(ImportTestStatus.FAILED)
         if batch.test_pending_rows + batch.test_running_rows == 0:
             batch.status = ImportBatchStatus.COMPLETED
             batch.finished_at = datetime.now(timezone.utc)
@@ -194,43 +147,35 @@ class ImportTestService:
         self,
         row_id: int,
     ) -> tuple[int, ImportTestTarget | None] | None:
-        def load() -> tuple[int, ImportTestTarget | None] | None:
-            with self.session_factory() as session:
-                row = session.get(ImportRowResult, row_id)
-                if row is None or row.test_status != ImportTestStatus.PENDING:
-                    return None
-                batch_id = row.batch_id
-                device = session.get(Device, row.device_id)
-                target = (
-                    None
-                    if device is None
-                    else ImportTestTarget(
-                        device_id=device.id,
-                        os_type=device.os_type,
-                        host=device.host,
-                        port=device.port,
-                        username=device.username,
-                        encrypted_password=device.encrypted_password,
-                    )
+        def load(session: Session) -> tuple[int, ImportTestTarget | None] | None:
+            row = session.get(ImportRowResult, row_id)
+            if row is None or row.test_status != ImportTestStatus.PENDING:
+                return None
+            batch_id = row.batch_id
+            device = session.get(Device, row.device_id)
+            target = (
+                None
+                if device is None
+                else ImportTestTarget(
+                    device_id=device.id,
+                    os_type=device.os_type,
+                    host=device.host,
+                    port=device.port,
+                    username=device.username,
+                    encrypted_password=device.encrypted_password,
                 )
-                row.test_status = ImportTestStatus.RUNNING
-                row.test_message = "正在测试连接"
-                session.flush()
-                self._refresh_batch_counts(session, batch_id)
-                session.commit()
-                return batch_id, target
-
-        return self._run_database_operation(load)
-
-    def _test_target(
-        self,
-        target: ImportTestTarget | None,
-    ) -> ImportTestOutcome:
-        if target is None:
-            return ImportTestOutcome(
-                ImportTestStatus.FAILED,
-                "导入设备不存在",
             )
+            row.test_status = ImportTestStatus.RUNNING
+            row.test_message = "正在测试连接"
+            session.flush()
+            self._refresh_batch_counts(session, batch_id)
+            return batch_id, target
+
+        return self.write_coordinator.write("claim_import_test_row", load)
+
+    def _test_target(self, target: ImportTestTarget | None) -> ImportTestOutcome:
+        if target is None:
+            return ImportTestOutcome(ImportTestStatus.FAILED, "导入设备不存在")
         password = ""
         try:
             password = self.cipher.decrypt(target.encrypted_password)
@@ -248,39 +193,27 @@ class ImportTestService:
                 ),
                 password,
             )
-            return ImportTestOutcome(
-                ImportTestStatus.SUCCESS,
-                "连接测试成功",
-            )
+            return ImportTestOutcome(ImportTestStatus.SUCCESS, "连接测试成功")
         except Exception as exc:  # noqa: BLE001 - persist per-device test failure
             return ImportTestOutcome(
                 ImportTestStatus.FAILED,
                 safe_error_message(str(exc), (password,)),
             )
 
-    def _save_result(
-        self,
-        row_id: int,
-        outcome: ImportTestOutcome,
-    ) -> int | None:
-        def save() -> int | None:
-            completed_batch_id: int | None = None
-            with self.session_factory() as session:
-                row = session.get(ImportRowResult, row_id)
-                if row is None or row.test_status not in {
-                    ImportTestStatus.PENDING,
-                    ImportTestStatus.RUNNING,
-                }:
-                    return None
-                row.test_status = outcome.status
-                row.test_message = outcome.message
-                session.flush()
-                if self._refresh_batch_counts(session, row.batch_id):
-                    completed_batch_id = row.batch_id
-                session.commit()
-            return completed_batch_id
+    def _save_result(self, row_id: int, outcome: ImportTestOutcome) -> int | None:
+        def save(session: Session) -> int | None:
+            row = session.get(ImportRowResult, row_id)
+            if row is None or row.test_status not in {
+                ImportTestStatus.PENDING,
+                ImportTestStatus.RUNNING,
+            }:
+                return None
+            row.test_status = outcome.status
+            row.test_message = outcome.message
+            session.flush()
+            return row.batch_id if self._refresh_batch_counts(session, row.batch_id) else None
 
-        return self._run_database_operation(save)
+        return self.write_coordinator.write("save_import_test_result", save)
 
     def test_row(self, row_id: int) -> None:
         try:
@@ -290,10 +223,7 @@ class ImportTestService:
             _, target = loaded
             outcome = self._test_target(target)
         except Exception as exc:
-            logger.exception(
-                "导入连接测试任务发生内部异常，行记录 %s",
-                row_id,
-            )
+            logger.exception("导入连接测试任务发生内部异常，行记录 %s", row_id)
             outcome = ImportTestOutcome(
                 ImportTestStatus.FAILED,
                 f"连接测试内部异常：{safe_error_message(str(exc), ())}",
@@ -309,11 +239,7 @@ class ImportTestService:
         if exception is not None:
             logger.error(
                 "导入连接测试后台任务异常",
-                exc_info=(
-                    type(exception),
-                    exception,
-                    exception.__traceback__,
-                ),
+                exc_info=(type(exception), exception, exception.__traceback__),
             )
 
     def _submit(self, row_id: int) -> None:

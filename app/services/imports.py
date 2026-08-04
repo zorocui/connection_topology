@@ -10,7 +10,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.datavalidation import DataValidation
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from app.models import (
     Device,
@@ -27,6 +27,7 @@ from app.services.clusters import (
     create_cluster,
     find_cluster_by_name,
 )
+from app.services.sqlite_writes import SQLiteWriteCoordinator
 
 MAX_IMPORT_BYTES = 5 * 1024 * 1024
 MAX_IMPORT_ROWS = 1000
@@ -225,18 +226,26 @@ def import_devices(
     cipher: CredentialCipher,
     filename: str,
     content: bytes,
+    write_coordinator: SQLiteWriteCoordinator | None = None,
 ) -> ImportBatch:
+    write_coordinator = write_coordinator or SQLiteWriteCoordinator(
+        sessionmaker(bind=session.get_bind(), autoflush=False, expire_on_commit=False),
+        (0.1, 0.3),
+    )
     rows = _load_rows(filename, content)
     batch = ImportBatch(
         filename=Path(filename).name[:255],
         status=ImportBatchStatus.IMPORTING,
         total_rows=len(rows),
     )
-    session.add(batch)
-    session.commit()
-    session.refresh(batch)
+    with write_coordinator.write_once("create_import_batch"):
+        session.add(batch)
+        session.commit()
+        session.refresh(batch)
 
     for row_number, values in rows:
+        row_guard = write_coordinator.write_once("import_device_row")
+        row_guard.__enter__()
         device_name = None
         host = None
         try:
@@ -292,6 +301,7 @@ def import_devices(
                     )
                     batch.skipped_rows += 1
                 session.commit()
+                row_guard.__exit__(None, None, None)
                 continue
             cluster = None
             if parsed["cluster_name"]:
@@ -372,17 +382,19 @@ def import_devices(
                 )
             )
             session.commit()
-    batch = session.get(ImportBatch, batch.id)
-    assert batch is not None
-    batch.status = (
-        ImportBatchStatus.TESTING
-        if batch.test_pending_rows
-        else ImportBatchStatus.COMPLETED
-    )
-    if batch.status == ImportBatchStatus.COMPLETED:
-        batch.finished_at = datetime.now(timezone.utc)
-    session.commit()
-    session.refresh(batch)
+        row_guard.__exit__(None, None, None)
+    with write_coordinator.write_once("finish_import_batch"):
+        batch = session.get(ImportBatch, batch.id)
+        assert batch is not None
+        batch.status = (
+            ImportBatchStatus.TESTING
+            if batch.test_pending_rows
+            else ImportBatchStatus.COMPLETED
+        )
+        if batch.status == ImportBatchStatus.COMPLETED:
+            batch.finished_at = datetime.now(timezone.utc)
+        session.commit()
+        session.refresh(batch)
     return batch
 
 

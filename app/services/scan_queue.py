@@ -25,7 +25,12 @@ from app.models import (
     ScanTrigger,
 )
 from app.security import CredentialCipher
-from app.services.scans import ScanService
+from app.services.scans import ScanOutcome, ScanService, add_scan_outcome
+from app.services.sqlite_writes import (
+    DATABASE_BUSY_MESSAGE,
+    DatabaseBusy,
+    SQLiteWriteCoordinator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +64,7 @@ class ScanQueueService:
         cipher: CredentialCipher,
         linux_collector: Collector,
         windows_collector: Collector,
+        write_coordinator: SQLiteWriteCoordinator,
         *,
         max_workers: int,
         queue_size: int,
@@ -68,6 +74,13 @@ class ScanQueueService:
         self.cipher = cipher
         self.linux_collector = linux_collector
         self.windows_collector = windows_collector
+        self.write_coordinator = write_coordinator
+        self.scan_service = ScanService(
+            session_factory,
+            cipher,
+            linux_collector,
+            windows_collector,
+        )
         self.max_workers = max_workers
         self.queue_size = queue_size
         self.on_successful_scan = on_successful_scan
@@ -159,19 +172,20 @@ class ScanQueueService:
         priority: int,
         batch_id: int | None = None,
     ) -> ScanTask:
-        with self._enqueue_lock, self.session_factory() as session:
+        def enqueue(session: Session) -> int:
             task = self._enqueue_in_session(
-                session,
-                device_id,
-                trigger,
-                priority,
-                batch_id,
+                session, device_id, trigger, priority, batch_id
             )
             session.flush()
             if batch_id is not None:
                 self._refresh_batch(session, batch_id)
-            session.commit()
-            session.refresh(task)
+            return task.id
+
+        with self._enqueue_lock:
+            task_id = self.write_coordinator.write("enqueue_scan_device", enqueue)
+        with self.session_factory() as session:
+            task = session.get(ScanTask, task_id)
+            assert task is not None
         self._wake_event.set()
         return task
 
@@ -241,7 +255,7 @@ class ScanQueueService:
         cluster_id: int | None = None,
         source_import_batch_id: int | None = None,
     ) -> ScanBatch:
-        with self._enqueue_lock, self.session_factory() as session:
+        def create(session: Session) -> int:
             batch = self._create_batch_in_session(
                 session,
                 batch_type,
@@ -249,18 +263,23 @@ class ScanQueueService:
                 cluster_id=cluster_id,
                 source_import_batch_id=source_import_batch_id,
             )
-            session.commit()
-            session.refresh(batch)
+            return batch.id
+
+        with self._enqueue_lock:
+            batch_id = self.write_coordinator.write("create_scan_batch", create)
+        with self.session_factory() as session:
+            batch = session.get(ScanBatch, batch_id)
+            assert batch is not None
         self._wake_event.set()
         return batch
 
     def create_import_scan_batch(self, import_batch_id: int) -> ScanBatch | None:
-        with self._enqueue_lock, self.session_factory() as session:
+        def create(session: Session) -> int | None:
             import_batch = session.get(ImportBatch, import_batch_id)
             if import_batch is None:
                 return None
             if import_batch.scan_batch_id is not None:
-                return session.get(ScanBatch, import_batch.scan_batch_id)
+                return import_batch.scan_batch_id
             device_ids = session.scalars(
                 select(ImportRowResult.device_id).where(
                     ImportRowResult.batch_id == import_batch_id,
@@ -275,8 +294,15 @@ class ScanQueueService:
                 source_import_batch_id=import_batch_id,
             )
             import_batch.scan_batch_id = batch.id
-            session.commit()
-            session.refresh(batch)
+            return batch.id
+
+        with self._enqueue_lock:
+            batch_id = self.write_coordinator.write("create_import_scan_batch", create)
+        if batch_id is None:
+            return None
+        with self.session_factory() as session:
+            batch = session.get(ScanBatch, batch_id)
+            assert batch is not None
         self._wake_event.set()
         return batch
 
@@ -311,7 +337,7 @@ class ScanQueueService:
             batch.finished_at = datetime.now(timezone.utc)
 
     def recover_running_tasks(self) -> int:
-        with self._enqueue_lock, self.session_factory() as session:
+        def recover(session: Session) -> int:
             tasks = session.scalars(
                 select(ScanTask).where(ScanTask.status == ScanTaskStatus.RUNNING)
             ).all()
@@ -325,13 +351,15 @@ class ScanQueueService:
             session.flush()
             for batch_id in batch_ids:
                 self._refresh_batch(session, batch_id)
-            session.commit()
             return len(tasks)
+
+        with self._enqueue_lock:
+            return self.write_coordinator.write("recover_scan_tasks", recover)
 
     def _claim_tasks(self, limit: int) -> list[int]:
         if limit <= 0:
             return []
-        with self._claim_lock, self.session_factory() as session:
+        def claim(session: Session) -> list[int]:
             tasks = session.scalars(
                 select(ScanTask)
                 .where(ScanTask.status == ScanTaskStatus.PENDING)
@@ -351,50 +379,83 @@ class ScanQueueService:
             session.flush()
             for batch_id in batch_ids:
                 self._refresh_batch(session, batch_id)
-            session.commit()
             return [task.id for task in tasks]
+
+        with self._claim_lock:
+            return self.write_coordinator.write("claim_scan_tasks", claim)
 
     def _claim_next_task(self) -> int | None:
         task_ids = self._claim_tasks(1)
         return task_ids[0] if task_ids else None
 
     def _execute_task(self, task_id: int) -> None:
-        successful = False
         with self.session_factory() as session:
             task = session.get(ScanTask, task_id)
             if task is None or task.status != ScanTaskStatus.RUNNING:
                 return
-            run = ScanService(
-                session,
-                self.cipher,
-                self.linux_collector,
-                self.windows_collector,
-            ).run(task.device_id, task.trigger_type)
-            task = session.get(ScanTask, task_id)
-            if task is None:
-                return
-            task.scan_run_id = run.id
-            task.finished_at = datetime.now(timezone.utc)
-            task.error_message = run.error_message
-            task.status = (
-                ScanTaskStatus.SUCCESS
-                if run.status == ScanStatus.SUCCESS
-                else ScanTaskStatus.FAILED
+            device_id = task.device_id
+            trigger = task.trigger_type
+
+        outcome = self.scan_service.collect(device_id, trigger)
+
+        try:
+            successful = self.write_coordinator.write(
+                "persist_scan",
+                lambda session: self._persist_outcome(session, task_id, outcome),
             )
-            successful = task.status == ScanTaskStatus.SUCCESS
-            batch_ids: set[int] = set()
-            for item in task.items:
-                item.status = task.status
-                batch_ids.add(item.batch_id)
-            session.flush()
-            for batch_id in batch_ids:
-                self._refresh_batch(session, batch_id)
-            session.commit()
+        except DatabaseBusy:
+            try:
+                self._record_database_busy(task_id, outcome)
+            except DatabaseBusy:
+                logger.exception("扫描任务 %s 数据库繁忙状态无法保存", task_id)
+            return
         if successful and self.on_successful_scan:
             try:
                 self.on_successful_scan()
             except Exception:
                 logger.exception("历史拓扑缓存失效失败")
+
+    def _persist_outcome(
+        self,
+        session: Session,
+        task_id: int,
+        outcome: ScanOutcome,
+    ) -> bool:
+        task = session.get(ScanTask, task_id)
+        if task is None or task.status != ScanTaskStatus.RUNNING:
+            return False
+        run = add_scan_outcome(session, outcome)
+        task.scan_run_id = run.id
+        task.finished_at = outcome.finished_at
+        task.error_message = outcome.error_message
+        task.status = (
+            ScanTaskStatus.SUCCESS
+            if outcome.status == ScanStatus.SUCCESS
+            else ScanTaskStatus.FAILED
+        )
+        batch_ids: set[int] = set()
+        for item in task.items:
+            item.status = task.status
+            batch_ids.add(item.batch_id)
+        session.flush()
+        for batch_id in batch_ids:
+            self._refresh_batch(session, batch_id)
+        return task.status == ScanTaskStatus.SUCCESS
+
+    def _record_database_busy(self, task_id: int, outcome: ScanOutcome) -> None:
+        busy_outcome = ScanOutcome(
+            device_id=outcome.device_id,
+            trigger=outcome.trigger,
+            status=ScanStatus.FAILED,
+            started_at=outcome.started_at,
+            finished_at=datetime.now(timezone.utc),
+            error_code="database_busy",
+            error_message=DATABASE_BUSY_MESSAGE,
+        )
+        self.write_coordinator.write(
+            "record_database_busy",
+            lambda session: self._persist_outcome(session, task_id, busy_outcome),
+        )
 
     def _execute_safely(self, task_id: int) -> None:
         try:
@@ -425,7 +486,7 @@ class ScanQueueService:
                 self._wake_event.wait(0.5)
 
     def _fail_unexpected_task(self, task_id: int) -> None:
-        with self.session_factory() as session:
+        def fail(session: Session) -> None:
             task = session.get(ScanTask, task_id)
             if task is None or task.status not in ACTIVE_TASK_STATUSES:
                 return
@@ -439,7 +500,8 @@ class ScanQueueService:
             session.flush()
             for batch_id in batch_ids:
                 self._refresh_batch(session, batch_id)
-            session.commit()
+
+        self.write_coordinator.write("fail_scan_task", fail)
 
     def start(self) -> None:
         if self._executor is not None:
@@ -472,7 +534,7 @@ class ScanQueueService:
         self._executor = None
 
     def cancel_device(self, device_id: int) -> bool:
-        with self._enqueue_lock, self.session_factory() as session:
+        def cancel(session: Session) -> bool:
             task = self._active_task(session, device_id)
             if task is None:
                 return True
@@ -487,5 +549,7 @@ class ScanQueueService:
             session.flush()
             for batch_id in batch_ids:
                 self._refresh_batch(session, batch_id)
-            session.commit()
             return True
+
+        with self._enqueue_lock:
+            return self.write_coordinator.write("cancel_scan_device", cancel)

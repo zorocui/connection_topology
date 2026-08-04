@@ -15,6 +15,7 @@ from app.services.scan_queue import (
     ScanQueueFull,
     ScanQueueService,
 )
+from app.services.sqlite_writes import SQLiteWriteCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -54,11 +55,16 @@ class SchedulerService:
         session_factory: sessionmaker[Session],
         scan_queue: ScanQueueService,
         scan_jitter_seconds: int,
+        write_coordinator: SQLiteWriteCoordinator | None = None,
         on_history_purged: Callable[[], None] | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.scan_queue = scan_queue
         self.scan_jitter_seconds = scan_jitter_seconds
+        self.write_coordinator = write_coordinator or SQLiteWriteCoordinator(
+            session_factory,
+            (0.1, 0.3),
+        )
         self.on_history_purged = on_history_purged
         self.scheduler = BackgroundScheduler(timezone="UTC")
 
@@ -75,7 +81,10 @@ class SchedulerService:
             logger.info("设备 %s 仅用于集群标注，跳过定时采集", device_id)
 
     def _purge_history(self) -> None:
-        with self.session_factory() as session:
+        with (
+            self.write_coordinator.write_once("purge_history"),
+            self.session_factory() as session,
+        ):
             setting = session.get(SystemSetting, 1)
             purge_expired_scans(
                 session,

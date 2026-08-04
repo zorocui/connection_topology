@@ -3,16 +3,19 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.collectors.base import CollectionResult
 from app.models import (
+    ConnectionRecord,
     Device,
     OSType,
     ScanBatch,
     ScanBatchItem,
     ScanBatchStatus,
     ScanBatchType,
+    ScanRun,
+    ScanStatus,
     ScanTask,
     ScanTaskStatus,
     ScanTrigger,
@@ -24,6 +27,7 @@ from app.services.scan_queue import (
     ScanQueueFull,
     ScanQueueService,
 )
+from app.services.sqlite_writes import DATABASE_BUSY_MESSAGE, DatabaseBusy
 
 
 def make_queue(
@@ -38,6 +42,7 @@ def make_queue(
         app.state.cipher,
         app.state.linux_collector,
         app.state.windows_collector,
+        app.state.sqlite_write_coordinator,
         max_workers=max_workers,
         queue_size=queue_size,
         on_successful_scan=on_successful_scan,
@@ -60,6 +65,80 @@ def seed_devices(app, count):
         session.add_all(devices)
         session.commit()
         return [device.id for device in devices]
+
+
+def test_execute_persists_run_device_task_items_and_batch_atomically(app):
+    device_id = seed_devices(app, 1)[0]
+    queue = make_queue(app)
+    batch = queue.create_batch(ScanBatchType.ALL, [device_id])
+    task_id = queue._claim_next_task()
+
+    queue._execute_task(task_id)
+
+    with app.state.session_factory() as session:
+        task = session.get(ScanTask, task_id)
+        run = session.get(ScanRun, task.scan_run_id)
+        item = session.scalar(
+            select(ScanBatchItem).where(ScanBatchItem.batch_id == batch.id)
+        )
+        persisted_batch = session.get(ScanBatch, batch.id)
+        device = session.get(Device, device_id)
+        assert task.status == ScanTaskStatus.SUCCESS
+        assert run.status == ScanStatus.SUCCESS
+        assert device.last_scan_status == ScanStatus.SUCCESS
+        assert item.status == ScanTaskStatus.SUCCESS
+        assert persisted_batch.success_tasks == 1
+        assert persisted_batch.status == ScanBatchStatus.COMPLETED
+
+
+def test_claims_enqueue_and_batch_mutations_use_shared_coordinator(app, monkeypatch):
+    calls = []
+    original = app.state.sqlite_write_coordinator.write
+
+    def recording_write(name, operation):
+        calls.append(name)
+        return original(name, operation)
+
+    monkeypatch.setattr(app.state.sqlite_write_coordinator, "write", recording_write)
+    device_id = seed_devices(app, 1)[0]
+    queue = app.state.scan_queue
+    batch = queue.create_batch(ScanBatchType.ALL, [device_id])
+    task_id = queue._claim_next_task()
+    queue.cancel_device(device_id)
+    assert {"create_scan_batch", "claim_scan_tasks", "cancel_scan_device"} <= set(calls)
+    assert batch.id
+    assert task_id
+
+
+def test_persist_retry_exhaustion_records_database_busy(app, monkeypatch):
+    device_id = seed_devices(app, 1)[0]
+    queue = make_queue(app)
+    batch = queue.create_batch(ScanBatchType.ALL, [device_id])
+    task_id = queue._claim_next_task()
+    original = queue.write_coordinator.write
+
+    def fail_persist(name, operation):
+        if name == "persist_scan":
+            raise DatabaseBusy(name)
+        return original(name, operation)
+
+    monkeypatch.setattr(queue.write_coordinator, "write", fail_persist)
+    queue._execute_safely(task_id)
+
+    with app.state.session_factory() as session:
+        task = session.get(ScanTask, task_id)
+        run = session.get(ScanRun, task.scan_run_id)
+        persisted_batch = session.get(ScanBatch, batch.id)
+        assert task.status == ScanTaskStatus.FAILED
+        assert task.error_message == DATABASE_BUSY_MESSAGE
+        assert run.error_code == "database_busy"
+        assert run.error_message == DATABASE_BUSY_MESSAGE
+        assert session.scalar(
+            select(func.count()).select_from(ConnectionRecord).where(
+                ConnectionRecord.scan_run_id == run.id
+            )
+        ) == 0
+        assert persisted_batch.failed_tasks == 1
 
 
 def seed_marker(app):
@@ -219,6 +298,7 @@ def test_worker_pool_reaches_configured_network_concurrency(app):
         app.state.cipher,
         collector,
         collector,
+        app.state.sqlite_write_coordinator,
         max_workers=30,
         queue_size=100,
     )
