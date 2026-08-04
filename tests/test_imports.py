@@ -1,4 +1,5 @@
 from io import BytesIO
+from contextlib import contextmanager
 
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import select
@@ -23,6 +24,35 @@ def workbook_bytes(rows) -> bytes:
     stream = BytesIO()
     workbook.save(stream)
     return stream.getvalue()
+
+
+def test_import_transactions_enter_shared_write_once(app, monkeypatch):
+    names = []
+    original = app.state.sqlite_write_coordinator.write_once
+
+    @contextmanager
+    def recording(name):
+        names.append(name)
+        with original(name):
+            yield
+
+    monkeypatch.setattr(app.state.sqlite_write_coordinator, "write_once", recording)
+    content = workbook_bytes(
+        [("one", "10.0.0.89", "linux", 22, "ops", "secret", "", 5, True)]
+    )
+    with app.state.session_factory() as session:
+        import_devices(
+            session,
+            app.state.cipher,
+            "devices.xlsx",
+            content,
+            app.state.sqlite_write_coordinator,
+        )
+    assert names == [
+        "create_import_batch",
+        "import_device_row",
+        "finish_import_batch",
+    ]
 
 
 def test_template_has_required_sheets_and_headers():

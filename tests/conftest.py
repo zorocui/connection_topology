@@ -84,6 +84,12 @@ def app(tmp_path, valid_key):
     application.state.scan_queue.scan_service.collectors[OSType.WINDOWS] = (
         application.state.windows_collector
     )
+    application.state.import_test_service.linux_collector = (
+        application.state.linux_collector
+    )
+    application.state.import_test_service.windows_collector = (
+        application.state.windows_collector
+    )
     return application
 
 

@@ -45,16 +45,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         sqlite_process_guard.acquire()
         try:
             init_database(engine)
-            with session_factory() as session:
-                setting = session.get(SystemSetting, 1)
-                if setting is None:
-                    session.add(
-                        SystemSetting(
-                            id=1,
-                            history_retention_days=resolved.history_retention_days,
+            with sqlite_write_coordinator.write_once("initialize_settings"):
+                with session_factory() as session:
+                    setting = session.get(SystemSetting, 1)
+                    if setting is None:
+                        session.add(
+                            SystemSetting(
+                                id=1,
+                                history_retention_days=resolved.history_retention_days,
+                            )
                         )
-                    )
-                    session.commit()
+                        session.commit()
             app.state.scan_queue.start()
             if app.state.scheduler:
                 app.state.scheduler.start()
@@ -106,6 +107,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.import_executor,
         app.state.linux_collector,
         app.state.windows_collector,
+        sqlite_write_coordinator,
         app.state.scan_queue.create_import_scan_batch,
     )
     app.state.scheduler = (
@@ -113,6 +115,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             session_factory,
             app.state.scan_queue,
             resolved.scan_jitter_seconds,
+            sqlite_write_coordinator,
             on_history_purged=app.state.topology_cache.clear,
         )
         if resolved.scheduler_enabled

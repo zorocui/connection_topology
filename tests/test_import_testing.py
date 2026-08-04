@@ -3,7 +3,6 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from sqlalchemy import text
-from sqlalchemy.exc import TimeoutError as SATimeoutError
 
 from app.collectors.base import CollectionResult, CollectorError
 from app.models import (
@@ -16,7 +15,6 @@ from app.models import (
     OSType,
     ScanBatch,
 )
-from app.services import import_testing as import_testing_module
 from app.services.import_testing import ImportTestService
 
 
@@ -454,29 +452,19 @@ def test_future_database_exception_is_logged(app, caplog):
     assert "database unavailable" in caplog.text
 
 
-def test_database_operation_retries_transient_pool_timeout(app, monkeypatch):
-    service = ImportTestService(
-        app.state.session_factory,
-        app.state.cipher,
-        ImmediateExecutor(),
-        FakeCollector(),
-        FakeCollector(),
-    )
-    attempts = 0
-    waits = []
+def test_import_testing_uses_application_write_coordinator(app, monkeypatch):
+    names = []
+    original = app.state.sqlite_write_coordinator.write
 
-    def operation():
-        nonlocal attempts
-        attempts += 1
-        if attempts < 3:
-            raise SATimeoutError("pool busy")
-        return "ok"
+    def recording_write(name, operation):
+        names.append(name)
+        return original(name, operation)
 
-    monkeypatch.setattr(import_testing_module.time, "sleep", waits.append)
-
-    assert service._run_database_operation(operation) == "ok"
-    assert attempts == 3
-    assert waits == [0.1, 0.3]
+    monkeypatch.setattr(app.state.sqlite_write_coordinator, "write", recording_write)
+    _, row_id, _ = seed_pending_row(app, "10.0.0.88")
+    app.state.import_test_service.test_row(row_id)
+    assert "claim_import_test_row" in names
+    assert "save_import_test_result" in names
 
 
 def test_unexpected_row_error_is_persisted_as_failure(app, monkeypatch):

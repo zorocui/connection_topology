@@ -1,7 +1,37 @@
 import time
+from contextlib import contextmanager
 
 from app.collectors.base import CollectorError
 from app.models import Device, OSType
+
+
+def test_mutating_routes_enter_shared_write_once(
+    client,
+    app,
+    linux_device_payload,
+    monkeypatch,
+):
+    names = []
+    original = app.state.sqlite_write_coordinator.write_once
+
+    @contextmanager
+    def recording(name):
+        names.append(name)
+        with original(name):
+            yield
+
+    monkeypatch.setattr(app.state.sqlite_write_coordinator, "write_once", recording)
+    assert client.post("/api/clusters", json={"name": "coordinated"}).status_code == 201
+    assert client.post("/api/devices", json=linux_device_payload).status_code == 201
+    assert client.put(
+        "/api/settings",
+        json={"history_retention_days": 11},
+    ).status_code == 200
+    assert {
+        "api_create_cluster",
+        "api_create_device",
+        "api_update_settings",
+    } <= set(names)
 
 
 def seed_marker_device(app, *, host):

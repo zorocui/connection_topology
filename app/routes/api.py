@@ -1,4 +1,6 @@
 import logging
+from contextlib import contextmanager
+from functools import wraps
 from datetime import datetime
 from urllib.parse import quote
 
@@ -72,6 +74,7 @@ from app.services.scan_queue import (
     ScanQueueFull,
 )
 from app.services.scans import ScanService
+from app.services.sqlite_writes import DatabaseBusy
 from app.services.topology import build_cluster_topology, build_topology, diff_scans
 from app.services.topology_history import (
     TopologyWindow,
@@ -81,6 +84,30 @@ from app.services.topology_history import (
 
 router = APIRouter(prefix="/api")
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _write_request(request: Request, operation_name: str):
+    try:
+        with request.app.state.sqlite_write_coordinator.write_once(operation_name):
+            yield
+    except DatabaseBusy as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def _coordinated_route(operation_name: str):
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            request = kwargs.get("request")
+            if request is None:
+                request = next(arg for arg in args if isinstance(arg, Request))
+            with _write_request(request, operation_name):
+                return function(*args, **kwargs)
+
+        return wrapped
+
+    return decorate
 
 
 def _clear_topology_cache(request: Request) -> None:
@@ -164,9 +191,17 @@ async def upload_import(
 ):
     content = await file.read(MAX_IMPORT_BYTES + 1)
     try:
-        batch = import_devices(db, request.app.state.cipher, file.filename or "import.xlsx", content)
+        batch = import_devices(
+            db,
+            request.app.state.cipher,
+            file.filename or "import.xlsx",
+            content,
+            request.app.state.sqlite_write_coordinator,
+        )
     except ImportValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except DatabaseBusy as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     imported_rows = db.scalars(
         select(ImportRowResult).where(
             ImportRowResult.batch_id == batch.id,
@@ -234,29 +269,31 @@ def add_cluster(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    try:
-        cluster = create_cluster(
-            db,
-            payload.name,
-            payload.description,
-            payload.internal_networks,
-        )
-        cluster.history_retention_days = payload.history_retention_days
-        cluster.scan_interval_minutes = payload.scan_interval_minutes
-        cluster.scheduled_enabled = payload.scheduled_enabled
-        db.commit()
-        db.refresh(cluster)
-    except ClusterConflict as exc:
-        db.rollback()
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:
-        db.rollback()
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    with _write_request(request, "api_create_cluster"):
+        try:
+            cluster = create_cluster(
+                db,
+                payload.name,
+                payload.description,
+                payload.internal_networks,
+            )
+            cluster.history_retention_days = payload.history_retention_days
+            cluster.scan_interval_minutes = payload.scan_interval_minutes
+            cluster.scheduled_enabled = payload.scheduled_enabled
+            db.commit()
+            db.refresh(cluster)
+        except ClusterConflict as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     _clear_topology_cache(request)
     return _cluster_read(cluster, 0, _system_retention_days(db))
 
 
 @router.put("/clusters/{cluster_id}", response_model=ClusterRead)
+@_coordinated_route("api_update_cluster")
 def edit_cluster(
     cluster_id: int,
     payload: ClusterUpdate,
@@ -309,6 +346,7 @@ def edit_cluster(
 
 
 @router.delete("/clusters/{cluster_id}", status_code=status.HTTP_204_NO_CONTENT)
+@_coordinated_route("api_delete_cluster")
 def remove_cluster(
     cluster_id: int,
     request: Request,
@@ -375,40 +413,43 @@ def create_device(payload: DeviceCreate, request: Request, db: Session = Depends
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={"code": exc.code, "message": str(exc)},
         ) from exc
-    try:
-        cluster = resolve_cluster(db, payload.cluster_id, payload.new_cluster_name)
-    except ValueError as exc:
-        db.rollback()
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    scan_interval, scheduled_enabled = cluster_scan_values(
-        cluster,
-        payload.scan_interval_minutes,
-        payload.scheduled_enabled,
-    )
-    device = Device(
-        name=payload.name,
-        host=payload.host,
-        os_type=payload.os_type,
-        port=payload.port,
-        username=payload.username,
-        encrypted_password=request.app.state.cipher.encrypt(payload.password),
-        scan_interval_minutes=scan_interval,
-        scheduled_enabled=scheduled_enabled,
-        history_retention_days=payload.history_retention_days,
-        cluster_id=cluster.id if cluster else None,
-    )
-    db.add(device)
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="相同地址、端口和用户名的设备已存在") from exc
-    db.refresh(device)
+    with _write_request(request, "api_create_device"):
+        try:
+            cluster = resolve_cluster(db, payload.cluster_id, payload.new_cluster_name)
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        scan_interval, scheduled_enabled = cluster_scan_values(
+            cluster,
+            payload.scan_interval_minutes,
+            payload.scheduled_enabled,
+        )
+        device = Device(
+            name=payload.name,
+            host=payload.host,
+            os_type=payload.os_type,
+            port=payload.port,
+            username=payload.username,
+            encrypted_password=request.app.state.cipher.encrypt(payload.password),
+            scan_interval_minutes=scan_interval,
+            scheduled_enabled=scheduled_enabled,
+            history_retention_days=payload.history_retention_days,
+            cluster_id=cluster.id if cluster else None,
+        )
+        db.add(device)
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="相同地址、端口和用户名的设备已存在",
+            ) from exc
+        db.refresh(device)
     _clear_topology_cache(request)
     if request.app.state.scheduler:
         request.app.state.scheduler.sync_device(device)
     return _device_read(device, _system_retention_days(db))
-
 
 @router.put("/devices/{device_id}", response_model=DeviceRead)
 def update_device(
@@ -445,40 +486,44 @@ def update_device(
                 status_code=502,
                 detail={"code": exc.code, "message": str(exc)},
             ) from exc
-    for key, value in values.items():
-        setattr(device, key, value)
-    if cluster_id_was_set or new_cluster_name:
+    with _write_request(request, "api_update_device"):
+        for key, value in values.items():
+            setattr(device, key, value)
+        if cluster_id_was_set or new_cluster_name:
+            try:
+                cluster = resolve_cluster(db, cluster_id, new_cluster_name)
+                device.cluster_id = cluster.id if cluster else None
+                if cluster is not None:
+                    (
+                        device.scan_interval_minutes,
+                        device.scheduled_enabled,
+                    ) = cluster_scan_values(
+                        cluster,
+                        device.scan_interval_minutes,
+                        device.scheduled_enabled,
+                    )
+            except ValueError as exc:
+                db.rollback()
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if password:
+            device.encrypted_password = request.app.state.cipher.encrypt(password)
+            device.collection_enabled = True
         try:
-            cluster = resolve_cluster(db, cluster_id, new_cluster_name)
-            device.cluster_id = cluster.id if cluster else None
-            if cluster is not None:
-                (
-                    device.scan_interval_minutes,
-                    device.scheduled_enabled,
-                ) = cluster_scan_values(
-                    cluster,
-                    device.scan_interval_minutes,
-                    device.scheduled_enabled,
-                )
-        except ValueError as exc:
+            db.commit()
+        except IntegrityError as exc:
             db.rollback()
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-    if password:
-        device.encrypted_password = request.app.state.cipher.encrypt(password)
-        device.collection_enabled = True
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="相同地址、端口和用户名的设备已存在") from exc
-    db.refresh(device)
+            raise HTTPException(
+                status_code=409,
+                detail="相同地址、端口和用户名的设备已存在",
+            ) from exc
+        db.refresh(device)
     _clear_topology_cache(request)
     if request.app.state.scheduler:
         request.app.state.scheduler.sync_device(device)
     return _device_read(device, _system_retention_days(db))
 
-
 @router.delete("/devices/{device_id}", status_code=status.HTTP_204_NO_CONTENT)
+@_coordinated_route("api_delete_device")
 def delete_device(device_id: int, request: Request, db: Session = Depends(get_db)):
     device = db.get(Device, device_id)
     if device is None:
@@ -738,7 +783,12 @@ def get_settings_row(db: Session = Depends(get_db)):
 
 
 @router.put("/settings", response_model=SettingsRead)
-def update_settings(payload: SettingsUpdate, db: Session = Depends(get_db)):
+@_coordinated_route("api_update_settings")
+def update_settings(
+    payload: SettingsUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+):
     setting = db.get(SystemSetting, 1)
     if setting is None:
         setting = SystemSetting(id=1, history_retention_days=payload.history_retention_days)

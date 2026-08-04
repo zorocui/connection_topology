@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from contextlib import contextmanager
 
 from app.models import Device, OSType, ScanTrigger
 from app.services.scan_queue import PRIORITY_SCHEDULED
@@ -57,3 +58,24 @@ def test_marker_device_has_no_scheduled_job(app):
     )
     scheduler.sync_device(device)
     assert scheduler.scheduler.get_job("device-scan-100") is None
+
+
+def test_history_purge_enters_shared_write_once(app, monkeypatch):
+    names = []
+    original = app.state.sqlite_write_coordinator.write_once
+
+    @contextmanager
+    def recording(name):
+        names.append(name)
+        with original(name):
+            yield
+
+    monkeypatch.setattr(app.state.sqlite_write_coordinator, "write_once", recording)
+    scheduler = SchedulerService(
+        app.state.session_factory,
+        RecordingQueue(),
+        0,
+        app.state.sqlite_write_coordinator,
+    )
+    scheduler._purge_history()
+    assert names == ["purge_history"]
