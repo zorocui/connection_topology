@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -29,6 +30,7 @@ from app.services.clusters import (
 
 MAX_IMPORT_BYTES = 5 * 1024 * 1024
 MAX_IMPORT_ROWS = 1000
+logger = logging.getLogger(__name__)
 IMPORT_SHEET = "设备导入"
 IMPORT_HEADERS = (
     "设备名称",
@@ -98,7 +100,11 @@ def build_import_template() -> bytes:
         ("操作系统", "是", "仅填写 linux 或 windows"),
         ("端口", "否", "Linux 默认 22，Windows 默认 5985"),
         ("用户名", "是", "远程登录用户名"),
-        ("密码", "是", "明文仅用于导入；导入后请删除或加密保存源文件"),
+        (
+            "密码",
+            "条件必填",
+            "正常采集设备必须填写；仅用于集群标注的设备可留空，但必须填写所属集群。",
+        ),
         ("所属集群", "否", "不存在时自动创建，留空表示未分组"),
         (
             "采集间隔（分钟）",
@@ -167,14 +173,20 @@ def _parse_row(values: tuple) -> dict:
         raise ImportValidationError("操作系统只能填写 linux 或 windows")
     os_type = OSType(os_value)
     default_port = 22 if os_type == OSType.LINUX else 5985
+    password = _text(values[5], "密码", required=False, max_length=1024)
+    cluster_name = _text(
+        values[6], "所属集群", required=False, max_length=100
+    )
+    if not password and not cluster_name:
+        raise ImportValidationError("未填写密码时必须填写所属集群")
     return {
         "name": name,
         "host": host,
         "os_type": os_type,
         "port": _integer(values[3], "端口", default_port, 1, 65535),
         "username": _text(values[4], "用户名"),
-        "password": _text(values[5], "密码", max_length=1024),
-        "cluster_name": _text(values[6], "所属集群", required=False, max_length=100),
+        "password": password,
+        "cluster_name": cluster_name,
         "scan_interval_minutes": _integer(
             values[7], "采集间隔（分钟）", 5, 1, 10080
         ),
@@ -239,18 +251,46 @@ def import_devices(
                 )
             )
             if duplicate:
-                result = ImportRowResult(
-                    batch_id=batch.id,
-                    row_number=row_number,
-                    device_name=device_name,
-                    host=host,
-                    device_id=duplicate.id,
-                    import_status=ImportStatus.SKIPPED,
-                    import_message="设备已存在，已跳过",
-                    test_status=ImportTestStatus.NOT_APPLICABLE,
-                )
-                session.add(result)
-                batch.skipped_rows += 1
+                if not parsed["password"]:
+                    message = "设备已存在，未修改集群归属"
+                    session.add(
+                        ImportRowResult(
+                            batch_id=batch.id,
+                            row_number=row_number,
+                            device_name=device_name,
+                            host=host,
+                            device_id=duplicate.id,
+                            import_status=ImportStatus.ERROR,
+                            import_message=message,
+                            test_status=ImportTestStatus.NOT_APPLICABLE,
+                        )
+                    )
+                    batch.error_rows += 1
+                    logger.warning(
+                        "集群标注导入冲突 batch_id=%s row=%s name=%s host=%s "
+                        "port=%s username=%s reason=%s",
+                        batch.id,
+                        row_number,
+                        parsed["name"],
+                        parsed["host"],
+                        parsed["port"],
+                        parsed["username"],
+                        message,
+                    )
+                else:
+                    session.add(
+                        ImportRowResult(
+                            batch_id=batch.id,
+                            row_number=row_number,
+                            device_name=device_name,
+                            host=host,
+                            device_id=duplicate.id,
+                            import_status=ImportStatus.SKIPPED,
+                            import_message="设备已存在，已跳过",
+                            test_status=ImportTestStatus.NOT_APPLICABLE,
+                        )
+                    )
+                    batch.skipped_rows += 1
                 session.commit()
                 continue
             cluster = None
@@ -268,6 +308,17 @@ def import_devices(
                 parsed["scan_interval_minutes"],
                 parsed["scheduled_enabled"],
             )
+            collection_enabled = bool(parsed["password"])
+            test_status = (
+                ImportTestStatus.PENDING
+                if collection_enabled
+                else ImportTestStatus.NOT_APPLICABLE
+            )
+            import_message = (
+                "导入成功，等待连接测试"
+                if collection_enabled
+                else "仅标注集群设备，不执行连接测试"
+            )
             device = Device(
                 name=parsed["name"],
                 host=parsed["host"],
@@ -275,6 +326,7 @@ def import_devices(
                 port=parsed["port"],
                 username=parsed["username"],
                 encrypted_password=cipher.encrypt(parsed["password"]),
+                collection_enabled=collection_enabled,
                 cluster_id=cluster.id if cluster else None,
                 scan_interval_minutes=scan_interval,
                 scheduled_enabled=scheduled_enabled,
@@ -289,12 +341,13 @@ def import_devices(
                     host=host,
                     device_id=device.id,
                     import_status=ImportStatus.IMPORTED,
-                    import_message="导入成功，等待连接测试",
-                    test_status=ImportTestStatus.PENDING,
+                    import_message=import_message,
+                    test_status=test_status,
                 )
             )
             batch.imported_rows += 1
-            batch.test_pending_rows += 1
+            if collection_enabled:
+                batch.test_pending_rows += 1
             session.commit()
         except Exception as exc:  # noqa: BLE001 - every workbook row is isolated
             session.rollback()

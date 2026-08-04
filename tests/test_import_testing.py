@@ -202,6 +202,64 @@ def test_successful_import_creates_first_scan_batch(app):
         assert scan_batch.items[0].device_id == device_id
 
 
+def test_import_first_scan_batch_excludes_not_applicable_marker(app):
+    with app.state.session_factory() as session:
+        batch = ImportBatch(
+            filename="markers.xlsx",
+            status=ImportBatchStatus.COMPLETED,
+            total_rows=2,
+            imported_rows=2,
+        )
+        normal = Device(
+            name="normal",
+            host="10.0.0.75",
+            os_type=OSType.LINUX,
+            port=22,
+            username="ops",
+            encrypted_password=app.state.cipher.encrypt("secret"),
+        )
+        marker = Device(
+            name="marker",
+            host="10.0.0.76",
+            os_type=OSType.LINUX,
+            port=22,
+            username="ops",
+            encrypted_password=app.state.cipher.encrypt(""),
+            collection_enabled=False,
+        )
+        session.add_all([batch, normal, marker])
+        session.flush()
+        session.add_all(
+            [
+                ImportRowResult(
+                    batch_id=batch.id,
+                    row_number=2,
+                    device_id=normal.id,
+                    import_status=ImportStatus.IMPORTED,
+                    import_message="导入成功",
+                    test_status=ImportTestStatus.SUCCESS,
+                ),
+                ImportRowResult(
+                    batch_id=batch.id,
+                    row_number=3,
+                    device_id=marker.id,
+                    import_status=ImportStatus.IMPORTED,
+                    import_message="仅标注集群设备，不执行连接测试",
+                    test_status=ImportTestStatus.NOT_APPLICABLE,
+                ),
+            ]
+        )
+        session.commit()
+        batch_id = batch.id
+        normal_id = normal.id
+
+    scan_batch = app.state.scan_queue.create_import_scan_batch(batch_id)
+    with app.state.session_factory() as session:
+        persisted = session.get(ScanBatch, scan_batch.id)
+        assert persisted.total_tasks == 1
+        assert [item.device_id for item in persisted.items] == [normal_id]
+
+
 def test_network_wait_does_not_hold_database_connections(app):
     count = 20
     batch_id = seed_pending_rows(app, count)

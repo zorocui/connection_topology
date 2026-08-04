@@ -3,7 +3,7 @@ from io import BytesIO
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import select
 
-from app.models import Cluster, Device, ImportStatus, ImportTestStatus
+from app.models import Cluster, Device, ImportStatus, ImportTestStatus, OSType
 from app.services.imports import (
     IMPORT_HEADERS,
     ImportValidationError,
@@ -38,6 +38,120 @@ def test_template_has_required_sheets_and_headers():
     }
     assert "新集群" in instructions["采集间隔（分钟）"]
     assert "已有集群" in instructions["采集间隔（分钟）"]
+    assert "可留空" in instructions["密码"]
+    assert "所属集群" in instructions["密码"]
+
+
+def test_passwordless_row_requires_cluster(app):
+    content = workbook_bytes(
+        [("marker", "10.0.0.70", "linux", 22, "ops", "", "", 5, "否")]
+    )
+    with app.state.session_factory() as session:
+        batch = import_devices(session, app.state.cipher, "devices.xlsx", content)
+        assert batch.error_rows == 1
+        assert batch.imported_rows == 0
+        assert batch.rows[0].import_message == "未填写密码时必须填写所属集群"
+
+
+def test_passwordless_cluster_row_creates_non_collectible_member(app):
+    content = workbook_bytes(
+        [
+            (
+                "marker",
+                "10.0.0.71",
+                "linux",
+                22,
+                "ops",
+                "",
+                "marker-cluster",
+                5,
+                "是",
+            )
+        ]
+    )
+    with app.state.session_factory() as session:
+        batch = import_devices(session, app.state.cipher, "devices.xlsx", content)
+        device = session.scalar(select(Device).where(Device.host == "10.0.0.71"))
+        assert batch.status.value == "completed"
+        assert batch.imported_rows == 1
+        assert batch.test_pending_rows == 0
+        assert device.collection_enabled is False
+        assert app.state.cipher.decrypt(device.encrypted_password) == ""
+        assert device.cluster.name == "marker-cluster"
+        assert batch.rows[0].test_status == ImportTestStatus.NOT_APPLICABLE
+        assert batch.rows[0].import_message == "仅标注集群设备，不执行连接测试"
+
+
+def test_mixed_import_tests_only_password_devices(app):
+    content = workbook_bytes(
+        [
+            ("real", "10.0.0.72", "linux", 22, "ops", "secret", "mixed", 5, "是"),
+            ("marker", "10.0.0.73", "linux", 22, "ops", "", "mixed", 5, "是"),
+        ]
+    )
+    with app.state.session_factory() as session:
+        batch = import_devices(session, app.state.cipher, "devices.xlsx", content)
+        assert batch.test_pending_rows == 1
+        assert batch.status.value == "testing"
+        statuses = {row.device_name: row.test_status for row in batch.rows}
+        assert statuses == {
+            "real": ImportTestStatus.PENDING,
+            "marker": ImportTestStatus.NOT_APPLICABLE,
+        }
+
+
+def test_passwordless_duplicate_is_logged_and_does_not_modify_device(app, caplog):
+    content = workbook_bytes(
+        [
+            (
+                "marker-copy",
+                "10.0.0.74",
+                "linux",
+                22,
+                "ops",
+                "",
+                "new-cluster",
+                5,
+                "否",
+            )
+        ]
+    )
+    with app.state.session_factory() as session:
+        original = Device(
+            name="original",
+            host="10.0.0.74",
+            os_type=OSType.LINUX,
+            port=22,
+            username="ops",
+            encrypted_password=app.state.cipher.encrypt("secret"),
+        )
+        session.add(original)
+        session.commit()
+        original_id = original.id
+
+        with caplog.at_level("WARNING", logger="app.services.imports"):
+            batch = import_devices(session, app.state.cipher, "devices.xlsx", content)
+
+        session.refresh(original)
+        assert batch.error_rows == 1
+        assert batch.skipped_rows == 0
+        assert batch.rows[0].import_status == ImportStatus.ERROR
+        assert batch.rows[0].import_message == "设备已存在，未修改集群归属"
+        assert batch.rows[0].device_id == original_id
+        assert original.cluster_id is None
+        assert original.name == "original"
+        for expected in (
+            f"batch_id={batch.id}",
+            "row=2",
+            "name=marker-copy",
+            "host=10.0.0.74",
+            "port=22",
+            "username=ops",
+            "设备已存在，未修改集群归属",
+        ):
+            assert expected in caplog.text
+        assert "secret" not in caplog.text
+        assert original.encrypted_password not in caplog.text
 
 
 def test_mixed_import_encrypts_password_and_creates_cluster(app):
