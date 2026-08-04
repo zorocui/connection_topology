@@ -15,6 +15,7 @@ from app.collectors.base import (
 from app.models import Cluster, ConnectionRecord, Device, ScanRun
 from app.services.topology_history import (
     TopologyWindow,
+    aggregate_current_connections,
     aggregate_historical_connections,
     aggregate_service_connections,
     load_current_scans,
@@ -278,31 +279,40 @@ def build_cluster_topology(
     latest_scans = load_current_scans(
         session,
         device_ids,
-        with_connections=window == "current",
+        with_connections=target_cluster_id is None and window == "current",
     )
     current_scan_ids = {scan.id for scan in latest_scans.values()}
+    source_device_ids = None
+    inbound_addresses = None
+    if target_cluster_id is not None:
+        members = cluster_members.get(target_cluster_id, [])
+        source_device_ids = {device.id for device in members}
+        normalized_addresses = {
+            address
+            for device in members
+            for address in resolver.resolve(device.host)
+        }
+        inbound_addresses = set(normalized_addresses)
+        inbound_addresses.update(
+            f"::ffff:{address}"
+            for address in normalized_addresses
+            if ":" not in address
+        )
     if window == "current":
-        services = aggregate_service_connections(
-            list(latest_scans.values()),
-            current_scan_ids,
+        services = (
+            aggregate_service_connections(
+                list(latest_scans.values()),
+                current_scan_ids,
+            )
+            if target_cluster_id is None
+            else aggregate_current_connections(
+                session,
+                latest_scans,
+                source_device_ids=source_device_ids,
+                inbound_addresses=inbound_addresses,
+            )
         )
     else:
-        source_device_ids = None
-        inbound_addresses = None
-        if target_cluster_id is not None:
-            members = cluster_members.get(target_cluster_id, [])
-            source_device_ids = {device.id for device in members}
-            normalized_addresses = {
-                address
-                for device in members
-                for address in resolver.resolve(device.host)
-            }
-            inbound_addresses = set(normalized_addresses)
-            inbound_addresses.update(
-                f"::ffff:{address}"
-                for address in normalized_addresses
-                if ":" not in address
-            )
         services = aggregate_historical_connections(
             session,
             device_ids,
