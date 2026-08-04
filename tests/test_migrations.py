@@ -39,6 +39,36 @@ def test_existing_device_table_is_upgraded_without_data_loss(tmp_path):
         assert connection.execute(text("SELECT name FROM devices WHERE id=1")).scalar() == "legacy"
 
 
+def test_existing_devices_are_collection_enabled_after_v9_upgrade(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'collection-v9.db'}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE devices ("
+                "id INTEGER PRIMARY KEY, name VARCHAR(100), "
+                "encrypted_password TEXT NOT NULL)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO devices (id, name, encrypted_password) "
+                "VALUES (1, 'legacy', 'ciphertext')"
+            )
+        )
+
+    init_database(engine)
+
+    columns = {column["name"] for column in inspect(engine).get_columns("devices")}
+    assert "collection_enabled" in columns
+    with engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT collection_enabled FROM devices WHERE id = 1")
+        ).scalar() == 1
+        assert connection.execute(
+            text("SELECT MAX(version) FROM schema_versions")
+        ).scalar() == 9
+
+
 def test_cluster_internal_network_table_and_indexes_are_created(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'networks.db'}")
 
@@ -69,7 +99,7 @@ def test_cluster_internal_network_table_and_indexes_are_created(tmp_path):
     with engine.connect() as connection:
         assert connection.execute(
             text("SELECT MAX(version) FROM schema_versions")
-        ).scalar() == 8
+        ).scalar() == 9
 
 
 def test_version_six_changes_legacy_default_but_preserves_custom_value(tmp_path):

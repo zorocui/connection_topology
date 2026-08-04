@@ -148,6 +148,12 @@ class Device(Base):
     )
     scan_interval_minutes: Mapped[int] = mapped_column(Integer, default=5)
     scheduled_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    collection_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default="1",
+    )
     history_retention_days: Mapped[int | None] = mapped_column(
         Integer,
         nullable=True,

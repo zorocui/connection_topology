@@ -81,6 +81,7 @@ class DeviceRead(BaseModel):
     username: str
     scan_interval_minutes: int
     scheduled_enabled: bool
+    collection_enabled: bool
     history_retention_days: int | None
     effective_history_retention_days: int
     history_retention_source: Literal["device", "cluster", "system"]

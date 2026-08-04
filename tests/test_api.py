@@ -8,10 +8,12 @@ def test_device_workflow_never_returns_password(client, linux_device_payload):
     assert "password" not in body
     assert "encrypted_password" not in body
     assert body["port"] == 22
+    assert body["collection_enabled"] is True
 
     listed = client.get("/api/devices").json()
     assert listed[0]["name"] == "生产 Web 01"
     assert "encrypted_password" not in listed[0]
+    assert listed[0]["collection_enabled"] is True
 
 
 def test_scan_and_topology_workflow(client, linux_device_payload):

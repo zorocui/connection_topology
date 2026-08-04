@@ -1,6 +1,6 @@
 from sqlalchemy import Engine, inspect, text
 
-LATEST_SCHEMA_VERSION = 8
+LATEST_SCHEMA_VERSION = 9
 
 
 def run_migrations(engine: Engine) -> None:
@@ -55,6 +55,13 @@ def run_migrations(engine: Engine) -> None:
                     text(
                         "ALTER TABLE devices "
                         "ADD COLUMN history_retention_days INTEGER"
+                    )
+                )
+            if "collection_enabled" not in device_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE devices ADD COLUMN "
+                        "collection_enabled BOOLEAN NOT NULL DEFAULT 1"
                     )
                 )
             connection.execute(

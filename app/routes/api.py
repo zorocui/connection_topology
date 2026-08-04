@@ -124,6 +124,7 @@ def _device_read(device: Device, system_days: int) -> DeviceRead:
         username=device.username,
         scan_interval_minutes=device.scan_interval_minutes,
         scheduled_enabled=device.scheduled_enabled,
+        collection_enabled=device.collection_enabled,
         history_retention_days=device.history_retention_days,
         effective_history_retention_days=policy.days,
         history_retention_source=policy.source,
