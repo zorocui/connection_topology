@@ -12,6 +12,7 @@ from app.models import SystemSetting
 from app.routes import api, pages
 from app.security import CredentialCipher, SecretRedactingFilter
 from app.services.import_testing import ImportTestService
+from app.services.process_guard import SQLiteProcessGuard, sqlite_database_path
 from app.services.scan_queue import ScanQueueService
 from app.services.scheduler import SchedulerService
 from app.services.topology import HostAddressResolver
@@ -29,30 +30,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     session_factory = create_session_factory(engine)
     cipher = CredentialCipher(resolved.app_secret_key)
+    sqlite_process_guard = SQLiteProcessGuard(
+        sqlite_database_path(resolved.database_url)
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        init_database(engine)
-        with session_factory() as session:
-            setting = session.get(SystemSetting, 1)
-            if setting is None:
-                session.add(
-                    SystemSetting(
-                        id=1,
-                        history_retention_days=resolved.history_retention_days,
+        sqlite_process_guard.acquire()
+        try:
+            init_database(engine)
+            with session_factory() as session:
+                setting = session.get(SystemSetting, 1)
+                if setting is None:
+                    session.add(
+                        SystemSetting(
+                            id=1,
+                            history_retention_days=resolved.history_retention_days,
+                        )
                     )
-                )
-                session.commit()
-        app.state.scan_queue.start()
-        if app.state.scheduler:
-            app.state.scheduler.start()
-        app.state.import_test_service.resume_pending()
-        yield
-        if app.state.scheduler:
-            app.state.scheduler.shutdown()
-        app.state.import_executor.shutdown(wait=True, cancel_futures=False)
-        app.state.scan_queue.shutdown()
-        engine.dispose()
+                    session.commit()
+            app.state.scan_queue.start()
+            if app.state.scheduler:
+                app.state.scheduler.start()
+            app.state.import_test_service.resume_pending()
+            try:
+                yield
+            finally:
+                if app.state.scheduler:
+                    app.state.scheduler.shutdown()
+                app.state.import_executor.shutdown(wait=True, cancel_futures=False)
+                app.state.scan_queue.shutdown()
+        finally:
+            engine.dispose()
+            sqlite_process_guard.release()
 
     app = FastAPI(
         title="连接图谱",
@@ -64,6 +74,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.cipher = cipher
+    app.state.sqlite_process_guard = sqlite_process_guard
     app.state.address_resolver = HostAddressResolver()
     app.state.linux_collector = LinuxCollector(resolved.remote_timeout_seconds)
     app.state.windows_collector = WindowsCollector(resolved.remote_timeout_seconds)

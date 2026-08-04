@@ -17,4 +17,5 @@ backups/
 .package-*/
 .superpowers/
 .worktrees/
+*.app.lock
 .tmp-cytoscape/
