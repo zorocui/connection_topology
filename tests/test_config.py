@@ -46,3 +46,23 @@ def test_settings_reject_invalid_database_pool_values(
             _env_file=None,
             **{field: value},
         )
+
+
+def test_sqlite_write_retry_delays_default_and_env(valid_key, monkeypatch):
+    default = Settings(app_secret_key=valid_key, _env_file=None)
+    assert default.sqlite_write_retry_delays == (0.1, 0.3, 0.8, 1.5, 3.0)
+
+    monkeypatch.setenv("SQLITE_WRITE_RETRY_DELAYS", "0,0.25,2")
+    configured = Settings(app_secret_key=valid_key, _env_file=None)
+    assert configured.sqlite_write_retry_delays == (0.0, 0.25, 2.0)
+
+
+@pytest.mark.parametrize("value", ["", "-1,0.2", "abc", ",,,"])
+def test_sqlite_write_retry_delays_reject_invalid_values(
+    valid_key,
+    monkeypatch,
+    value,
+):
+    monkeypatch.setenv("SQLITE_WRITE_RETRY_DELAYS", value)
+    with pytest.raises(ValidationError):
+        Settings(app_secret_key=valid_key, _env_file=None)
