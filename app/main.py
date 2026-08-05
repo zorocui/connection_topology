@@ -7,7 +7,11 @@ from fastapi.staticfiles import StaticFiles
 
 from app.collectors import LinuxCollector, WindowsCollector
 from app.config import Settings, get_settings
-from app.database import create_database_engine, create_session_factory, init_database
+from app.database import (
+    assert_database_current,
+    create_database_engine,
+    create_session_factory,
+)
 from app.models import SystemSetting
 from app.routes import api, pages
 from app.security import CredentialCipher, SecretRedactingFilter
@@ -22,29 +26,21 @@ from app.services.topology_cache import TopologyCache
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or get_settings()
-    engine = create_database_engine(
-        resolved.database_url,
-        resolved.sqlite_busy_timeout_ms,
-        resolved.db_pool_size,
-        resolved.db_max_overflow,
-        resolved.db_pool_timeout_seconds,
-    )
+    engine = create_database_engine(resolved)
     session_factory = create_session_factory(engine)
     cipher = CredentialCipher(resolved.app_secret_key)
     sqlite_write_coordinator = SQLiteWriteCoordinator(
         session_factory,
-        resolved.sqlite_write_retry_delays,
+        (),
         enabled=engine.dialect.name == "sqlite",
     )
-    sqlite_process_guard = SQLiteProcessGuard(
-        sqlite_database_path(resolved.database_url)
-    )
+    sqlite_process_guard = SQLiteProcessGuard(sqlite_database_path(resolved.database_url))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         sqlite_process_guard.acquire()
         try:
-            init_database(engine)
+            assert_database_current(engine)
             with (
                 sqlite_write_coordinator.write_once("initialize_settings"),
                 session_factory() as session,

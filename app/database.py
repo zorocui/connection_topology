@@ -1,5 +1,8 @@
 from collections.abc import Generator
 
+from alembic.config import Config
+from alembic.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from fastapi import Request
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -27,12 +30,13 @@ def create_session_factory(engine: Engine) -> sessionmaker[Session]:
     return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
-def init_database(engine: Engine) -> None:
-    from app import models  # noqa: F401
-    from app.migrations import run_migrations
-
-    Base.metadata.create_all(engine)
-    run_migrations(engine)
+def assert_database_current(engine: Engine) -> None:
+    config = Config("alembic.ini")
+    script = ScriptDirectory.from_config(config)
+    with engine.connect() as connection:
+        current = MigrationContext.configure(connection).get_current_revision()
+    if current != script.get_current_head():
+        raise RuntimeError("数据库结构未升级，请先执行 alembic upgrade head")
 
 
 def get_db(request: Request) -> Generator[Session, None, None]:

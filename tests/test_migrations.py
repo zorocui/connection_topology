@@ -1,193 +1,117 @@
-from sqlalchemy import create_engine, inspect, text
+import pytest
+from alembic import command
+from alembic.config import Config
+from alembic.migration import MigrationContext
+from alembic.script import ScriptDirectory
+from fastapi.testclient import TestClient
+from sqlalchemy import inspect, text
 
-from app.database import init_database
+from app.config import Settings
+from app.database import assert_database_current
 
 
-def test_existing_device_table_is_upgraded_without_data_loss(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
-    with engine.begin() as connection:
-        connection.execute(
-            text("CREATE TABLE devices (id INTEGER PRIMARY KEY, name VARCHAR(100))")
+def alembic_config(database_url: str) -> Config:
+    config = Config("alembic.ini")
+    config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
+    return config
+
+
+@pytest.mark.migration
+def test_empty_postgresql_database_upgrades_to_head(
+    test_database_url,
+    migrated_engine,
+):
+    config = alembic_config(test_database_url)
+    try:
+        command.downgrade(config, "base")
+        command.upgrade(config, "head")
+        script = ScriptDirectory.from_config(config)
+        with migrated_engine.connect() as connection:
+            assert (
+                MigrationContext.configure(connection).get_current_revision()
+                == script.get_current_head()
+            )
+            tables = set(inspect(connection).get_table_names())
+            assert {"devices", "scan_tasks", "scan_runs", "import_row_results"} <= tables
+            columns = {column["name"] for column in inspect(connection).get_columns("scan_tasks")}
+            assert {
+                "worker_id",
+                "lease_expires_at",
+                "heartbeat_at",
+                "attempt_count",
+            } <= columns
+            import_columns = {
+                column["name"] for column in inspect(connection).get_columns("import_row_results")
+            }
+            assert {
+                "test_worker_id",
+                "test_lease_expires_at",
+                "test_heartbeat_at",
+                "test_attempt_count",
+            } <= import_columns
+    finally:
+        command.upgrade(config, "head")
+
+
+def test_active_scan_task_index_is_partial_postgresql_index(migrated_engine):
+    with migrated_engine.connect() as connection:
+        definition = connection.scalar(
+            text("SELECT indexdef FROM pg_indexes WHERE indexname='uq_scan_tasks_device_active'")
         )
-        connection.execute(text("INSERT INTO devices (id, name) VALUES (1, 'legacy')"))
-    init_database(engine)
-    inspector = inspect(engine)
-    assert "clusters" in inspector.get_table_names()
-    assert "cluster_internal_networks" in inspector.get_table_names()
-    assert "import_batches" in inspector.get_table_names()
-    assert "import_row_results" in inspector.get_table_names()
-    assert "scan_batches" in inspector.get_table_names()
-    assert "scan_tasks" in inspector.get_table_names()
-    assert "scan_batch_items" in inspector.get_table_names()
-    assert "cluster_id" in {column["name"] for column in inspector.get_columns("devices")}
-    assert "history_retention_days" in {
-        column["name"] for column in inspector.get_columns("devices")
-    }
-    assert "history_retention_days" in {
-        column["name"] for column in inspector.get_columns("clusters")
-    }
-    assert {"scan_interval_minutes", "scheduled_enabled"} <= {
-        column["name"] for column in inspector.get_columns("clusters")
-    }
-    assert "scan_batch_id" in {
-        column["name"] for column in inspector.get_columns("import_batches")
-    }
-    assert "uq_scan_tasks_device_active" in {
-        index["name"] for index in inspector.get_indexes("scan_tasks")
-    }
-    with engine.connect() as connection:
-        assert connection.execute(text("SELECT name FROM devices WHERE id=1")).scalar() == "legacy"
+    assert definition is not None
+    assert "WHERE" in definition
+    assert "PENDING" in definition and "RUNNING" in definition
 
 
-def test_existing_devices_are_collection_enabled_after_v9_upgrade(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'collection-v9.db'}")
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                "CREATE TABLE devices ("
-                "id INTEGER PRIMARY KEY, name VARCHAR(100), "
-                "encrypted_password TEXT NOT NULL)"
-            )
-        )
-        connection.execute(
-            text(
-                "INSERT INTO devices (id, name, encrypted_password) "
-                "VALUES (1, 'legacy', 'ciphertext')"
-            )
-        )
-
-    init_database(engine)
-
-    columns = {column["name"] for column in inspect(engine).get_columns("devices")}
-    assert "collection_enabled" in columns
-    with engine.connect() as connection:
-        assert connection.execute(
-            text("SELECT collection_enabled FROM devices WHERE id = 1")
-        ).scalar() == 1
-        assert connection.execute(
-            text("SELECT MAX(version) FROM schema_versions")
-        ).scalar() == 9
+def test_database_version_check_accepts_current_engine(migrated_engine):
+    assert_database_current(migrated_engine)
 
 
-def test_cluster_internal_network_table_and_indexes_are_created(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'networks.db'}")
-
-    init_database(engine)
-    init_database(engine)
-
-    inspector = inspect(engine)
-    assert "cluster_internal_networks" in inspector.get_table_names()
-    columns = {
-        column["name"]
-        for column in inspector.get_columns("cluster_internal_networks")
-    }
-    assert columns == {"id", "cluster_id", "cidr"}
-    indexes = {
-        index["name"]
-        for index in inspector.get_indexes("cluster_internal_networks")
-    }
-    assert "ix_cluster_internal_networks_cluster_id" in indexes
-    assert "ix_scan_device_status_started" in {
-        index["name"] for index in inspector.get_indexes("scan_runs")
-    }
-    connection_indexes = {
-        index["name"]
-        for index in inspector.get_indexes("connection_records")
-    }
-    assert "ix_connection_history_service" in connection_indexes
-    assert "ix_connection_remote_scan" in connection_indexes
-    with engine.connect() as connection:
-        assert connection.execute(
-            text("SELECT MAX(version) FROM schema_versions")
-        ).scalar() == 9
+@pytest.mark.migration
+def test_database_version_check_rejects_unmigrated_engine(
+    test_database_url,
+    migrated_engine,
+):
+    config = alembic_config(test_database_url)
+    try:
+        command.downgrade(config, "base")
+        with pytest.raises(RuntimeError, match="alembic upgrade head"):
+            assert_database_current(migrated_engine)
+    finally:
+        command.upgrade(config, "head")
 
 
-def test_version_six_changes_legacy_default_but_preserves_custom_value(tmp_path):
-    default_engine = create_engine(f"sqlite:///{tmp_path / 'default.db'}")
-    custom_engine = create_engine(f"sqlite:///{tmp_path / 'custom.db'}")
-    for engine, retention_days in ((default_engine, 30), (custom_engine, 45)):
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    "CREATE TABLE schema_versions "
-                    "(version INTEGER PRIMARY KEY, applied_at DATETIME)"
-                )
-            )
-            connection.execute(
-                text("INSERT INTO schema_versions (version) VALUES (5)")
-            )
-            connection.execute(
-                text(
-                    "CREATE TABLE system_settings "
-                    "(id INTEGER PRIMARY KEY, history_retention_days INTEGER)"
-                )
-            )
-            connection.execute(
-                text(
-                    "INSERT INTO system_settings "
-                    "(id, history_retention_days) VALUES (1, :days)"
-                ),
-                {"days": retention_days},
-            )
+@pytest.mark.migration
+def test_application_startup_does_not_migrate_an_empty_database(
+    test_database_url,
+    migrated_engine,
+    valid_key,
+):
+    from app.main import create_app
 
-        init_database(engine)
-        with engine.connect() as connection:
-            migrated = connection.execute(
-                text(
-                    "SELECT history_retention_days "
-                    "FROM system_settings WHERE id = 1"
-                )
-            ).scalar()
-        assert migrated == (7 if retention_days == 30 else 45)
-
-
-def test_version_seven_derives_cluster_scan_policy_from_members(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'scan-policy.db'}")
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                "CREATE TABLE schema_versions "
-                "(version INTEGER PRIMARY KEY, applied_at DATETIME)"
-            )
-        )
-        connection.execute(
-            text("INSERT INTO schema_versions (version) VALUES (6)")
-        )
-        connection.execute(
-            text(
-                "CREATE TABLE clusters "
-                "(id INTEGER PRIMARY KEY, name VARCHAR(100))"
-            )
-        )
-        connection.execute(
-            text(
-                "CREATE TABLE devices ("
-                "id INTEGER PRIMARY KEY, cluster_id INTEGER, "
-                "scan_interval_minutes INTEGER, scheduled_enabled BOOLEAN)"
-            )
-        )
-        connection.execute(
-            text(
-                "INSERT INTO clusters (id, name) VALUES "
-                "(1, 'mode'), (2, 'tie'), (3, 'empty')"
-            )
-        )
-        connection.execute(
-            text(
-                "INSERT INTO devices "
-                "(id, cluster_id, scan_interval_minutes, scheduled_enabled) "
-                "VALUES (1, 1, 5, 0), (2, 1, 10, 0), (3, 1, 10, 0), "
-                "(4, 2, 5, 0), (5, 2, 10, 1)"
-            )
-        )
-
-    init_database(engine)
-
-    with engine.connect() as connection:
-        rows = connection.execute(
-            text(
-                "SELECT id, scan_interval_minutes, scheduled_enabled "
-                "FROM clusters ORDER BY id"
-            )
-        ).all()
-    assert rows == [(1, 10, 0), (2, 5, 1), (3, 5, 1)]
+    config = alembic_config(test_database_url)
+    settings = Settings(
+        app_secret_key=valid_key,
+        database_url=test_database_url,
+        scheduler_enabled=False,
+        scan_max_workers=2,
+        import_test_max_workers=2,
+        db_pool_size=2,
+        db_max_overflow=0,
+        db_pool_timeout_seconds=1,
+        _env_file=None,
+    )
+    try:
+        command.downgrade(config, "base")
+        application = create_app(settings)
+        with (
+            pytest.raises(RuntimeError, match="alembic upgrade head"),
+            TestClient(application),
+        ):
+            pass
+        with migrated_engine.connect() as connection:
+            tables = set(inspect(connection).get_table_names())
+        assert "devices" not in tables
+        assert "scan_tasks" not in tables
+    finally:
+        command.upgrade(config, "head")

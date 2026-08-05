@@ -132,9 +132,7 @@ class ClusterInternalNetwork(Base):
 
 class Device(Base):
     __tablename__ = "devices"
-    __table_args__ = (
-        UniqueConstraint("host", "port", "username", name="uq_device_identity"),
-    )
+    __table_args__ = (UniqueConstraint("host", "port", "username", name="uq_device_identity"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(100))
@@ -244,15 +242,13 @@ class ScanTask(Base):
             "uq_scan_tasks_device_active",
             "device_id",
             unique=True,
-            sqlite_where=text("status IN ('PENDING', 'RUNNING')"),
+            postgresql_where=text("status IN ('PENDING', 'RUNNING')"),
         ),
         Index("ix_scan_tasks_claim", "status", "priority", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    device_id: Mapped[int] = mapped_column(
-        ForeignKey("devices.id", ondelete="CASCADE"), index=True
-    )
+    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id", ondelete="CASCADE"), index=True)
     trigger_type: Mapped[ScanTrigger] = mapped_column(Enum(ScanTrigger))
     priority: Mapped[int] = mapped_column(Integer, default=20, index=True)
     status: Mapped[ScanTaskStatus] = mapped_column(
@@ -265,6 +261,14 @@ class ScanTask(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
 
     device: Mapped[Device] = relationship(back_populates="scan_tasks")
     items: Mapped[list[ScanBatchItem]] = relationship(
@@ -286,9 +290,7 @@ class ScanBatchItem(Base):
     task_id: Mapped[int] = mapped_column(
         ForeignKey("scan_tasks.id", ondelete="CASCADE"), index=True
     )
-    device_id: Mapped[int] = mapped_column(
-        ForeignKey("devices.id", ondelete="CASCADE"), index=True
-    )
+    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id", ondelete="CASCADE"), index=True)
     status: Mapped[ScanTaskStatus] = mapped_column(
         Enum(ScanTaskStatus), default=ScanTaskStatus.PENDING, index=True
     )
@@ -361,7 +363,14 @@ class ImportBatch(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     fatal_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
     scan_batch_id: Mapped[int | None] = mapped_column(
-        ForeignKey("scan_batches.id", ondelete="SET NULL"), nullable=True, index=True
+        ForeignKey(
+            "scan_batches.id",
+            name="fk_import_batches_scan_batch_id_scan_batches",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        nullable=True,
+        index=True,
     )
 
     rows: Mapped[list[ImportRowResult]] = relationship(
@@ -387,6 +396,16 @@ class ImportRowResult(Base):
         Enum(ImportTestStatus), default=ImportTestStatus.NOT_APPLICABLE
     )
     test_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    test_worker_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    test_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    test_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    test_attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
 
     batch: Mapped[ImportBatch] = relationship(back_populates="rows")
     device: Mapped[Device | None] = relationship()

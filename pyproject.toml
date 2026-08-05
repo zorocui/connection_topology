@@ -38,6 +38,9 @@ include = ["app*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "migration: changes the PostgreSQL test database schema",
+]
 
 [tool.ruff]
 target-version = "py310"
