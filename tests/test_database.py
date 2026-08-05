@@ -1,17 +1,34 @@
-from sqlalchemy import text
+from unittest.mock import sentinel
 
+from app.config import Settings
 from app.database import create_database_engine
 
 
-def test_sqlite_concurrency_pragmas(tmp_path):
-    engine = create_database_engine(
-        f"sqlite:///{tmp_path / 'pragmas.db'}",
-        sqlite_busy_timeout_ms=12345,
+def test_database_engine_uses_postgresql_health_settings(monkeypatch, valid_key):
+    settings = Settings(
+        app_secret_key=valid_key,
+        database_url="postgresql+psycopg://app:secret@localhost/app",
+        _env_file=None,
     )
-    with engine.connect() as connection:
-        assert connection.execute(text("PRAGMA journal_mode")).scalar() == "wal"
-        assert connection.execute(text("PRAGMA foreign_keys")).scalar() == 1
-        assert connection.execute(text("PRAGMA busy_timeout")).scalar() == 12345
-        assert connection.execute(text("PRAGMA temp_store")).scalar() == 2
-        assert connection.execute(text("PRAGMA cache_size")).scalar() == -65536
-        assert connection.execute(text("PRAGMA mmap_size")).scalar() == 268435456
+    calls = []
+
+    def fake_create_engine(url, **kwargs):
+        calls.append((url, kwargs))
+        return sentinel.engine
+
+    monkeypatch.setattr("app.database.create_engine", fake_create_engine)
+
+    assert create_database_engine(settings) is sentinel.engine
+    assert calls == [
+        (
+            settings.database_url,
+            {
+                "pool_size": 3,
+                "max_overflow": 2,
+                "pool_timeout": 30,
+                "pool_recycle": 1800,
+                "pool_pre_ping": True,
+                "connect_args": {"connect_timeout": 10},
+            },
+        )
+    ]

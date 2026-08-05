@@ -11,7 +11,6 @@ from fastapi.testclient import TestClient
 from app.collectors.base import CollectionResult, NormalizedConnection
 from app.config import Settings
 from app.database import init_database
-from app.main import create_app
 from app.models import OSType
 
 
@@ -61,6 +60,8 @@ class FakeCollector:
 
 @pytest.fixture
 def app(tmp_path, valid_key):
+    from app.main import create_app
+
     settings = Settings(
         app_secret_key=valid_key,
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
