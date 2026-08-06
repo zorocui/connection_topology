@@ -57,6 +57,7 @@ class PostgresTransactionRunner:
         self._transaction_slots = (
             threading.BoundedSemaphore(capacity) if capacity is not None else None
         )
+        self._admission_state = threading.local()
 
     @staticmethod
     def _pool_capacity(session_factory: sessionmaker[Session]) -> int | None:
@@ -77,10 +78,20 @@ class PostgresTransactionRunner:
         if slots is None:
             yield
             return
+        depth = getattr(self._admission_state, "depth", 0)
+        if depth:
+            self._admission_state.depth = depth + 1
+            try:
+                yield
+            finally:
+                self._admission_state.depth = depth
+            return
         slots.acquire()
+        self._admission_state.depth = 1
         try:
             yield
         finally:
+            self._admission_state.depth = 0
             slots.release()
 
     def run(
@@ -125,7 +136,8 @@ class PostgresTransactionRunner:
     @contextmanager
     def guard(self, operation_name: str) -> Iterator[None]:
         try:
-            yield
+            with self._admit_transaction():
+                yield
         except DBAPIError as exc:
             if postgres_sqlstate(exc) in RETRYABLE_SQLSTATES:
                 raise TransactionConflict(operation_name) from exc

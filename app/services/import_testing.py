@@ -123,7 +123,9 @@ class ImportTestService:
                 self.batch_completed_callback(batch_id)
 
     def _refresh_batch_counts(self, session: Session, batch_id: int) -> bool:
-        batch = session.get(ImportBatch, batch_id)
+        batch = session.scalar(
+            select(ImportBatch).where(ImportBatch.id == batch_id).with_for_update()
+        )
         assert batch is not None
         was_completed = batch.status == ImportBatchStatus.COMPLETED
 

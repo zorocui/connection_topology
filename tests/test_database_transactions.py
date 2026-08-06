@@ -130,6 +130,72 @@ def test_runner_limits_database_callbacks_to_configured_capacity(app):
     assert maximum == 2
 
 
+def test_guard_limits_caller_owned_transactions_to_configured_capacity(app):
+    runner = PostgresTransactionRunner(
+        app.state.session_factory,
+        max_concurrent_transactions=2,
+    )
+    lock = threading.Lock()
+    active = 0
+    maximum = 0
+
+    def guarded_operation():
+        nonlocal active, maximum
+        with runner.guard("guarded"):
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            try:
+                time.sleep(0.02)
+            finally:
+                with lock:
+                    active -= 1
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(guarded_operation) for _ in range(10)]
+        for future in futures:
+            future.result()
+
+    assert maximum == 2
+
+
+def test_guard_releases_transaction_slot_after_exception(app):
+    runner = PostgresTransactionRunner(
+        app.state.session_factory,
+        max_concurrent_transactions=1,
+    )
+
+    with pytest.raises(ValueError, match="failed"), runner.guard("failing_guard"):
+        raise ValueError("failed")
+
+    entered = threading.Event()
+
+    def enter_guard():
+        with runner.guard("after_failure"):
+            entered.set()
+
+    thread = threading.Thread(target=enter_guard, daemon=True)
+    thread.start()
+    assert entered.wait(timeout=1)
+    thread.join(timeout=1)
+    assert thread.is_alive() is False
+
+
+def test_guard_can_call_run_reentrantly_without_consuming_another_slot(app):
+    runner = PostgresTransactionRunner(
+        app.state.session_factory,
+        max_concurrent_transactions=1,
+    )
+
+    with runner.guard("request_owned"):
+        result = runner.run(
+            "nested_write",
+            lambda session: session.scalar(text("SELECT 1")),
+        )
+
+    assert result == 1
+
+
 @pytest.mark.parametrize(
     "factory_error",
     [db_error(None), TimeoutError("pool exposed secret")],

@@ -315,7 +315,11 @@ def test_worker_pool_reaches_configured_network_concurrency(app):
                     break
             time.sleep(0.05)
         assert current.status == ScanBatchStatus.COMPLETED
+        assert current.total_tasks == 30
+        assert current.pending_tasks == 0
+        assert current.running_tasks == 0
         assert current.success_tasks == 30
+        assert current.failed_tasks == 0
         assert collector.maximum == 30
     finally:
         queue.shutdown()

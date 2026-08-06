@@ -308,7 +308,9 @@ class ScanQueueService:
         return batch
 
     def _refresh_batch(self, session: Session, batch_id: int) -> None:
-        batch = session.get(ScanBatch, batch_id)
+        batch = session.scalar(
+            select(ScanBatch).where(ScanBatch.id == batch_id).with_for_update()
+        )
         if batch is None:
             return
         session.flush()
