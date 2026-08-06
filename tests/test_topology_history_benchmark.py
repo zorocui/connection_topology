@@ -1,11 +1,11 @@
 from scripts.benchmark_topology_history import run_benchmark
 
 
-def test_history_benchmark_smoke(tmp_path):
+def test_history_benchmark_smoke(migrated_engine):
     result = run_benchmark(
         rows=5_000,
         max_seconds=10,
-        database_path=tmp_path / "benchmark.db",
+        engine=migrated_engine,
     )
 
     assert result["raw_rows"] == 5_000

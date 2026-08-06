@@ -3,20 +3,16 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import tempfile
+import os
 import time
 import tracemalloc
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any
 
-from sqlalchemy import insert
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import Engine, create_engine, insert, text
 
-from app.database import (
-    create_database_engine,
-    create_session_factory,
-    init_database,
-)
+from app.database import Base, create_session_factory
 from app.models import (
     ConnectionRecord,
     Device,
@@ -35,9 +31,17 @@ SCANS_PER_DEVICE = 48
 INSERT_BATCH_SIZE = 20_000
 
 
-def _seed_database(database_path: Path, rows: int) -> tuple[Any, datetime]:
-    engine = create_database_engine(f"sqlite:///{database_path.as_posix()}")
-    init_database(engine)
+def _reset_database(engine: Engine, allowed_database: str) -> None:
+    with engine.begin() as connection:
+        database_name = connection.scalar(text("SELECT current_database()"))
+        if database_name != allowed_database:
+            raise RuntimeError(f"refusing to reset unexpected database: {database_name}")
+        table_names = [table.name for table in reversed(Base.metadata.sorted_tables)]
+        quoted_names = ", ".join(f'"{name}"' for name in table_names)
+        connection.execute(text(f"TRUNCATE TABLE {quoted_names} RESTART IDENTITY CASCADE"))
+
+
+def _seed_database(engine: Engine, rows: int) -> datetime:
     reference = datetime.now(timezone.utc)
 
     device_rows = [
@@ -114,31 +118,20 @@ def _seed_database(database_path: Path, rows: int) -> tuple[Any, datetime]:
             connection.execute(insert(ConnectionRecord), batch)
         connection.exec_driver_sql("ANALYZE")
 
-    return engine, reference
+    return reference
 
 
 def run_benchmark(
     rows: int,
     max_seconds: float,
-    database_path: Path | None = None,
+    engine: Engine,
 ) -> dict[str, int | float | bool]:
     if rows < 1:
         raise ValueError("rows must be positive")
 
-    temporary_directory = None
-    if database_path is None:
-        temporary_directory = tempfile.TemporaryDirectory(
-            prefix="topology-history-benchmark-"
-        )
-        database_path = Path(temporary_directory.name) / "benchmark.db"
-    else:
-        database_path.parent.mkdir(parents=True, exist_ok=True)
-
-    engine = None
-    try:
-        engine, reference = _seed_database(database_path, rows)
-        session_factory = create_session_factory(engine)
-        with session_factory() as session:
+    reference = _seed_database(engine, rows)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
             devices = list(range(1, DEVICE_COUNT + 1))
             current_scans = load_current_scans(
                 session,
@@ -187,7 +180,7 @@ def run_benchmark(
             tracemalloc.stop()
             assert len(memory_probe_services) == service_groups
 
-        return {
+    return {
             "raw_rows": rows,
             "service_groups": service_groups,
             "elapsed_seconds": round(elapsed_seconds, 3),
@@ -198,28 +191,30 @@ def run_benchmark(
             "scoped_groups": scoped_groups,
             "scoped_seconds": round(scoped_seconds, 3),
             "scoped_within_target": scoped_seconds <= max_seconds,
-        }
-    finally:
-        if engine is not None:
-            engine.dispose()
-        if temporary_directory is not None:
-            temporary_directory.cleanup()
+    }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Benchmark exact SQLite historical topology aggregation."
+        description="Benchmark exact PostgreSQL historical topology aggregation."
     )
     parser.add_argument("--rows", type=int, default=1_370_000)
     parser.add_argument("--max-seconds", type=float, default=10.0)
-    parser.add_argument("--database-path", type=Path)
     arguments = parser.parse_args()
 
-    result = run_benchmark(
-        arguments.rows,
-        arguments.max_seconds,
-        arguments.database_path,
-    )
+    database_url = os.environ.get("BENCHMARK_DATABASE_URL")
+    if not database_url:
+        parser.error("BENCHMARK_DATABASE_URL is required")
+    config = Config("alembic.ini")
+    config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
+    command.upgrade(config, "head")
+    engine = create_engine(database_url, pool_pre_ping=True)
+    try:
+        _reset_database(engine, "connection_topology_benchmark")
+        result = run_benchmark(arguments.rows, arguments.max_seconds, engine)
+    finally:
+        engine.dispose()
+
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["within_target"] else 1
 
