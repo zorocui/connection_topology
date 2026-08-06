@@ -96,6 +96,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         transaction_runner,
         max_workers=resolved.scan_max_workers,
         queue_size=resolved.scan_queue_size,
+        lease_seconds=resolved.scan_lease_seconds,
         on_successful_scan=app.state.topology_cache.clear,
     )
     app.state.import_test_service = ImportTestService(

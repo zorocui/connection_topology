@@ -223,20 +223,24 @@ def test_claims_are_unique_across_threads(app):
     assert len(set(claimed)) == 30
 
 
-def test_recovery_resets_running_tasks_and_batches(app):
-    device_id = seed_devices(app, 1)[0]
-    queue = make_queue(app)
-    batch = queue.create_batch(ScanBatchType.ALL, [device_id])
-    assert queue._claim_next_task() is not None
+def test_two_queue_instances_share_application_wide_scan_limit(app):
+    device_ids = seed_devices(app, 40)
+    first_queue = make_queue(app, max_workers=30, queue_size=40)
+    second_queue = make_queue(app, max_workers=30, queue_size=40)
+    first_queue.create_batch(ScanBatchType.ALL, device_ids)
+    barrier = threading.Barrier(2)
 
-    assert queue.recover_running_tasks() == 1
+    def claim(queue):
+        barrier.wait()
+        return queue._claim_tasks(30)
 
-    with app.state.session_factory() as session:
-        task = session.scalar(select(ScanTask))
-        recovered_batch = session.get(ScanBatch, batch.id)
-        assert task.status == ScanTaskStatus.PENDING
-        assert recovered_batch.status == ScanBatchStatus.PENDING
-        assert recovered_batch.pending_tasks == 1
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(claim, queue) for queue in (first_queue, second_queue)]
+        first, second = [future.result() for future in futures]
+
+    assert first_queue.worker_id != second_queue.worker_id
+    assert set(first).isdisjoint(second)
+    assert len(first) + len(second) == 30
 
 
 def test_execute_task_settles_all_linked_batches(app):
@@ -291,6 +295,80 @@ class ConcurrencyCollector:
         with self.lock:
             self.active -= 1
         return CollectionResult(())
+
+
+class BlockingConcurrencyCollector:
+    def __init__(self, target_concurrency=30):
+        self.lock = threading.Lock()
+        self.release = threading.Event()
+        self.target_reached = threading.Event()
+        self.target_concurrency = target_concurrency
+        self.active = 0
+        self.maximum = 0
+        self.device_ids = []
+
+    def test_connection(self, device, password):
+        pass
+
+    def collect(self, device, password):
+        with self.lock:
+            self.active += 1
+            self.maximum = max(self.maximum, self.active)
+            self.device_ids.append(device.device_id)
+            if self.active >= self.target_concurrency:
+                self.target_reached.set()
+        self.release.wait(timeout=10)
+        with self.lock:
+            self.active -= 1
+        return CollectionResult(())
+
+
+def test_two_dispatchers_never_exceed_global_network_concurrency(app):
+    device_ids = seed_devices(app, 40)
+    collector = BlockingConcurrencyCollector()
+    first_queue = ScanQueueService(
+        app.state.session_factory,
+        app.state.cipher,
+        collector,
+        collector,
+        app.state.transaction_runner,
+        max_workers=30,
+        queue_size=100,
+    )
+    second_queue = ScanQueueService(
+        app.state.session_factory,
+        app.state.cipher,
+        collector,
+        collector,
+        app.state.transaction_runner,
+        max_workers=30,
+        queue_size=100,
+    )
+    first_queue.create_batch(ScanBatchType.ALL, device_ids)
+    first_queue.start()
+    second_queue.start()
+    try:
+        assert collector.target_reached.wait(timeout=10)
+        with app.state.session_factory() as session:
+            running = session.scalar(
+                select(func.count()).select_from(ScanTask).where(
+                    ScanTask.status == ScanTaskStatus.RUNNING
+                )
+            )
+            pending = session.scalar(
+                select(func.count()).select_from(ScanTask).where(
+                    ScanTask.status == ScanTaskStatus.PENDING
+                )
+            )
+        assert running == 30
+        assert pending == 10
+        assert collector.maximum == 30
+        assert len(collector.device_ids) == 30
+        assert len(set(collector.device_ids)) == 30
+    finally:
+        collector.release.set()
+        first_queue.shutdown()
+        second_queue.shutdown()
 
 
 def test_worker_pool_reaches_configured_network_concurrency(app):

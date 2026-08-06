@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import uuid
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ from app.services.database_transactions import (
     TransactionConflict,
 )
 from app.services.scans import ScanOutcome, ScanService, add_scan_outcome
+from app.services.task_leases import claim_scan_tasks, refresh_scan_batches
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,7 @@ class ScanQueueService:
         *,
         max_workers: int,
         queue_size: int,
+        lease_seconds: int = 90,
         on_successful_scan: Callable[[], None] | None = None,
     ) -> None:
         self.session_factory = session_factory
@@ -84,9 +87,10 @@ class ScanQueueService:
         )
         self.max_workers = max_workers
         self.queue_size = queue_size
+        self.lease_seconds = lease_seconds
+        self.worker_id = uuid.uuid4().hex
         self.on_successful_scan = on_successful_scan
         self._enqueue_lock = threading.RLock()
-        self._claim_lock = threading.Lock()
         self._wake_event = threading.Event()
         self._stop_event = threading.Event()
         self._executor: ThreadPoolExecutor | None = None
@@ -308,84 +312,19 @@ class ScanQueueService:
         return batch
 
     def _refresh_batch(self, session: Session, batch_id: int) -> None:
-        batch = session.scalar(
-            select(ScanBatch).where(ScanBatch.id == batch_id).with_for_update()
-        )
-        if batch is None:
-            return
-        session.flush()
-        counts = dict(
-            session.execute(
-                select(ScanBatchItem.status, func.count())
-                .where(ScanBatchItem.batch_id == batch_id)
-                .group_by(ScanBatchItem.status)
-            ).all()
-        )
-        batch.total_tasks = sum(counts.values())
-        batch.pending_tasks = counts.get(ScanTaskStatus.PENDING, 0)
-        batch.running_tasks = counts.get(ScanTaskStatus.RUNNING, 0)
-        batch.success_tasks = counts.get(ScanTaskStatus.SUCCESS, 0)
-        batch.failed_tasks = counts.get(ScanTaskStatus.FAILED, 0) + counts.get(
-            ScanTaskStatus.CANCELLED, 0
-        )
-        if batch.pending_tasks or batch.running_tasks:
-            batch.status = (
-                ScanBatchStatus.RUNNING
-                if batch.running_tasks or batch.success_tasks or batch.failed_tasks
-                else ScanBatchStatus.PENDING
-            )
-            batch.finished_at = None
-        else:
-            batch.status = ScanBatchStatus.COMPLETED
-            batch.finished_at = datetime.now(timezone.utc)
-
-    def recover_running_tasks(self) -> int:
-        def recover(session: Session) -> int:
-            tasks = session.scalars(
-                select(ScanTask).where(ScanTask.status == ScanTaskStatus.RUNNING)
-            ).all()
-            batch_ids: set[int] = set()
-            for task in tasks:
-                task.status = ScanTaskStatus.PENDING
-                task.started_at = None
-                for item in task.items:
-                    item.status = ScanTaskStatus.PENDING
-                    batch_ids.add(item.batch_id)
-            session.flush()
-            for batch_id in batch_ids:
-                self._refresh_batch(session, batch_id)
-            return len(tasks)
-
-        with self._enqueue_lock:
-            return self.transaction_runner.run("recover_scan_tasks", recover)
+        refresh_scan_batches(session, {batch_id})
 
     def _claim_tasks(self, limit: int) -> list[int]:
-        if limit <= 0:
-            return []
-        def claim(session: Session) -> list[int]:
-            tasks = session.scalars(
-                select(ScanTask)
-                .where(ScanTask.status == ScanTaskStatus.PENDING)
-                .order_by(ScanTask.priority.desc(), ScanTask.created_at, ScanTask.id)
-                .limit(limit)
-            ).all()
-            if not tasks:
-                return []
-            started_at = datetime.now(timezone.utc)
-            batch_ids: set[int] = set()
-            for task in tasks:
-                task.status = ScanTaskStatus.RUNNING
-                task.started_at = started_at
-                for item in task.items:
-                    item.status = ScanTaskStatus.RUNNING
-                    batch_ids.add(item.batch_id)
-            session.flush()
-            for batch_id in batch_ids:
-                self._refresh_batch(session, batch_id)
-            return [task.id for task in tasks]
-
-        with self._claim_lock:
-            return self.transaction_runner.run("claim_scan_tasks", claim)
+        return self.transaction_runner.run(
+            "claim_scan_tasks",
+            lambda session: claim_scan_tasks(
+                session,
+                self.worker_id,
+                limit,
+                self.max_workers,
+                self.lease_seconds,
+            ),
+        )
 
     def _claim_next_task(self) -> int | None:
         task_ids = self._claim_tasks(1)
@@ -520,7 +459,6 @@ class ScanQueueService:
         if self._executor is not None:
             return
         self._stop_event.clear()
-        self.recover_running_tasks()
         self._executor = ThreadPoolExecutor(
             max_workers=self.max_workers,
             thread_name_prefix="device-scan",
