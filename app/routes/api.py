@@ -63,6 +63,7 @@ from app.services.imports import (
     build_import_template,
     import_devices,
 )
+from app.services.postgres_notifications import notify_topology_changed
 from app.services.retention import resolve_device_retention
 from app.services.scan_batch_failures import (
     failed_device_ids,
@@ -280,6 +281,7 @@ def add_cluster(
             cluster.history_retention_days = payload.history_retention_days
             cluster.scan_interval_minutes = payload.scan_interval_minutes
             cluster.scheduled_enabled = payload.scheduled_enabled
+            notify_topology_changed(db)
             db.commit()
             db.refresh(cluster)
         except ClusterConflict as exc:
@@ -323,6 +325,7 @@ def edit_cluster(
             payload.internal_networks,
         )
         members = apply_cluster_scan_policy(db, cluster)
+        notify_topology_changed(db)
         db.commit()
     except ClusterConflict as exc:
         db.rollback()
@@ -356,6 +359,7 @@ def remove_cluster(
     if cluster is None:
         raise HTTPException(status_code=404, detail="集群不存在")
     delete_cluster(db, cluster)
+    notify_topology_changed(db)
     db.commit()
     _clear_topology_cache(request)
 
@@ -438,6 +442,7 @@ def create_device(payload: DeviceCreate, request: Request, db: Session = Depends
         )
         db.add(device)
         try:
+            notify_topology_changed(db)
             db.commit()
         except IntegrityError as exc:
             db.rollback()
@@ -509,6 +514,7 @@ def update_device(
             device.encrypted_password = request.app.state.cipher.encrypt(password)
             device.collection_enabled = True
         try:
+            notify_topology_changed(db)
             db.commit()
         except IntegrityError as exc:
             db.rollback()
@@ -533,6 +539,7 @@ def delete_device(device_id: int, request: Request, db: Session = Depends(get_db
     if not request.app.state.scan_queue.cancel_device(device_id, session=db):
         raise HTTPException(status_code=409, detail="该设备正在扫描，请稍后再删除")
     db.delete(device)
+    notify_topology_changed(db)
     db.commit()
     _clear_topology_cache(request)
 

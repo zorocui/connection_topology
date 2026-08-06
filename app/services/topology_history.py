@@ -316,38 +316,42 @@ def aggregate_historical_connections(
         eligible.c.process_key,
     )
     payload_separator = "\x1f"
-    latest_marker = func.printf(
-        "%030s|%020d|%020d",
-        cast(eligible.c.started_at, String),
-        eligible.c.scan_id,
-        eligible.c.connection_id,
+    latest_marker = (
+        func.to_char(eligible.c.started_at, "YYYYMMDDHH24MISSUS")
+        + literal("|")
+        + func.lpad(cast(eligible.c.scan_id, String), 20, "0")
+        + literal("|")
+        + func.lpad(cast(eligible.c.connection_id, String), 20, "0")
     )
     latest_payload = func.max(
         latest_marker
         + literal(payload_separator)
-        + func.json_object(
-            "connection_id",
-            eligible.c.connection_id,
-            "protocol",
-            eligible.c.protocol,
-            "local_ip",
-            eligible.c.local_ip,
-            "local_port",
-            eligible.c.local_port,
-            "remote_port",
-            eligible.c.remote_port,
-            "state",
-            eligible.c.state,
-            "pid",
-            eligible.c.pid,
-            "process_name",
-            eligible.c.process_name,
-            "device_id",
-            eligible.c.device_id,
-            "scan_id",
-            eligible.c.scan_id,
-            "started_at",
-            cast(eligible.c.started_at, String),
+        + cast(
+            func.json_build_object(
+                "connection_id",
+                eligible.c.connection_id,
+                "protocol",
+                eligible.c.protocol,
+                "local_ip",
+                eligible.c.local_ip,
+                "local_port",
+                eligible.c.local_port,
+                "remote_port",
+                eligible.c.remote_port,
+                "state",
+                eligible.c.state,
+                "pid",
+                eligible.c.pid,
+                "process_name",
+                eligible.c.process_name,
+                "device_id",
+                eligible.c.device_id,
+                "scan_id",
+                eligible.c.scan_id,
+                "started_at_epoch",
+                func.extract("epoch", eligible.c.started_at),
+            ),
+            String,
         )
     ).label("latest_payload")
     hostname_payload = func.max(
@@ -366,16 +370,24 @@ def aggregate_historical_connections(
             *raw_key,
             func.min(eligible.c.started_at).label("first_seen"),
             func.max(eligible.c.started_at).label("last_seen"),
-            func.group_concat(func.distinct(eligible.c.scan_id)).label(
+            func.string_agg(
+                func.distinct(cast(eligible.c.scan_id, String)), literal(",")
+            ).label(
                 "scan_ids"
             ),
-            func.group_concat(func.distinct(eligible.c.local_ip)).label(
+            func.string_agg(
+                func.distinct(eligible.c.local_ip), literal(",")
+            ).label(
                 "local_ips"
             ),
-            func.group_concat(func.distinct(eligible.c.local_port)).label(
+            func.string_agg(
+                func.distinct(cast(eligible.c.local_port, String)), literal(",")
+            ).label(
                 "local_ports"
             ),
-            func.group_concat(func.distinct(eligible.c.pid)).label("pids"),
+            func.string_agg(
+                func.distinct(cast(eligible.c.pid, String)), literal(",")
+            ).label("pids"),
             latest_payload,
             hostname_payload,
         ).group_by(*raw_key)
@@ -387,7 +399,10 @@ def aggregate_historical_connections(
     for row in aggregate_rows:
         _, encoded_latest = row.latest_payload.split(payload_separator, 1)
         latest = json.loads(encoded_latest)
-        latest["started_at"] = datetime.fromisoformat(latest["started_at"])
+        latest["started_at"] = datetime.fromtimestamp(
+            float(latest.pop("started_at_epoch")),
+            timezone.utc,
+        ).astimezone(row.first_seen.tzinfo)
         hostname = (
             row.hostname_payload.split(payload_separator, 1)[1]
             if row.hostname_payload

@@ -16,6 +16,10 @@ from app.routes import api, pages
 from app.security import CredentialCipher, SecretRedactingFilter
 from app.services.database_transactions import PostgresTransactionRunner
 from app.services.import_testing import ImportTestService
+from app.services.postgres_notifications import (
+    TOPOLOGY_CHANNEL,
+    PostgresNotificationListener,
+)
 from app.services.process_guard import SQLiteProcessGuard, sqlite_database_path
 from app.services.scan_queue import ScanQueueService
 from app.services.scheduler import SchedulerService
@@ -53,6 +57,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     )
                     session.commit()
             app.state.scan_queue.start()
+            app.state.topology_listener.start()
             if app.state.scheduler:
                 app.state.scheduler.start()
             app.state.import_test_service.start()
@@ -63,6 +68,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state.scheduler.shutdown()
                 app.state.import_test_service.shutdown()
                 app.state.scan_queue.shutdown()
+                app.state.topology_listener.shutdown()
         finally:
             engine.dispose()
             sqlite_process_guard.release()
@@ -83,6 +89,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.linux_collector = LinuxCollector(resolved.remote_timeout_seconds)
     app.state.windows_collector = WindowsCollector(resolved.remote_timeout_seconds)
     app.state.topology_cache = TopologyCache(ttl_seconds=30)
+    app.state.topology_listener = PostgresNotificationListener(
+        resolved.database_url,
+        TOPOLOGY_CHANNEL,
+        app.state.topology_cache.clear,
+    )
     app.state.scan_queue = ScanQueueService(
         session_factory,
         cipher,

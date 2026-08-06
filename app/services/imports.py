@@ -28,6 +28,7 @@ from app.services.clusters import (
     find_cluster_by_name,
 )
 from app.services.database_transactions import PostgresTransactionRunner
+from app.services.postgres_notifications import notify_topology_changed
 
 MAX_IMPORT_BYTES = 5 * 1024 * 1024
 MAX_IMPORT_ROWS = 1000
@@ -356,6 +357,7 @@ def import_devices(
                 batch.imported_rows += 1
                 if collection_enabled:
                     batch.test_pending_rows += 1
+                notify_topology_changed(session)
                 session.commit()
             except Exception as exc:
                 session.rollback()

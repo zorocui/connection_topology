@@ -14,6 +14,7 @@ from app.services.postgres_leader import (
     SCHEDULER_LEADER_LOCK_KEY,
     PostgresLeaderElector,
 )
+from app.services.postgres_notifications import notify_topology_changed
 from app.services.retention import resolve_device_retention
 from app.services.scan_queue import (
     PRIORITY_SCHEDULED,
@@ -50,6 +51,8 @@ def purge_expired_scans(
             )
         )
         deleted += result.rowcount or 0
+    if deleted:
+        notify_topology_changed(session)
     session.commit()
     return deleted
 

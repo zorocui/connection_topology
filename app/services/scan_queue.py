@@ -32,6 +32,7 @@ from app.services.database_transactions import (
     PostgresTransactionRunner,
     TransactionConflict,
 )
+from app.services.postgres_notifications import notify_topology_changed
 from app.services.scans import ScanOutcome, ScanService, add_scan_outcome
 from app.services.task_leases import (
     TaskLeaseLost,
@@ -422,6 +423,8 @@ class ScanQueueService:
         session.flush()
         for batch_id in batch_ids:
             self._refresh_batch(session, batch_id)
+        if task.status == ScanTaskStatus.SUCCESS:
+            notify_topology_changed(session)
         return task.status == ScanTaskStatus.SUCCESS
 
     def _record_transaction_conflict(self, task_id: int, outcome: ScanOutcome) -> None:
