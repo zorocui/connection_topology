@@ -1,6 +1,8 @@
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 
@@ -39,6 +41,17 @@ class FakeCollector:
 
     def collect(self, device, password):
         return CollectionResult(())
+
+
+def wait_for_import_batch(app, batch_id, timeout=30):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with app.state.session_factory() as session:
+            batch = session.get(ImportBatch, batch_id)
+            if batch.status == ImportBatchStatus.COMPLETED:
+                return
+        time.sleep(0.05)
+    raise AssertionError(f"import batch {batch_id} did not complete")
 
 
 class BarrierCollector:
@@ -325,6 +338,8 @@ def test_resume_pending_recovers_stale_running_row(app):
         row = session.get(ImportRowResult, row_id)
         row.test_status = ImportTestStatus.RUNNING
         row.test_message = "正在测试连接"
+        row.test_worker_id = "dead-worker"
+        row.test_lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
         batch = session.get(ImportBatch, batch_id)
         batch.test_pending_rows = 0
         batch.test_running_rows = 1
@@ -333,11 +348,13 @@ def test_resume_pending_recovers_stale_running_row(app):
     service = ImportTestService(
         app.state.session_factory,
         app.state.cipher,
-        ImmediateExecutor(),
+        None,
         FakeCollector(),
         FakeCollector(),
     )
     service.resume_pending()
+    wait_for_import_batch(app, batch_id)
+    service.shutdown()
 
     with app.state.session_factory() as session:
         row = session.get(ImportRowResult, row_id)
@@ -460,7 +477,7 @@ def test_future_exception_log_does_not_include_raw_error_details(app, caplog):
     service = ImportTestService(
         app.state.session_factory,
         app.state.cipher,
-        ImmediateExecutor(),
+        None,
         FakeCollector(),
         FakeCollector(),
     )
@@ -519,19 +536,19 @@ def test_unexpected_row_error_is_persisted_as_failure(app, monkeypatch):
 def test_150_import_tests_complete_without_pool_timeout(app):
     count = 150
     batch_id = seed_pending_rows(app, count)
-    executor = ThreadPoolExecutor(max_workers=20)
     service = ImportTestService(
         app.state.session_factory,
         app.state.cipher,
-        executor,
+        None,
         FakeCollector(),
         FakeCollector(),
         app.state.scan_queue.create_import_scan_batch,
     )
+    service.start()
     try:
-        service.schedule_batch(batch_id)
+        wait_for_import_batch(app, batch_id, timeout=60)
     finally:
-        executor.shutdown(wait=True)
+        service.shutdown()
 
     with app.state.session_factory() as session:
         batch = session.get(ImportBatch, batch_id)
@@ -548,19 +565,19 @@ def test_150_import_tests_complete_without_pool_timeout(app):
 def test_1000_import_tests_complete_and_create_one_scan_batch(app):
     count = 1000
     batch_id = seed_pending_rows(app, count)
-    executor = ThreadPoolExecutor(max_workers=20)
     service = ImportTestService(
         app.state.session_factory,
         app.state.cipher,
-        executor,
+        None,
         FakeCollector(),
         FakeCollector(),
         app.state.scan_queue.create_import_scan_batch,
     )
+    service.start()
     try:
-        service.schedule_batch(batch_id)
+        wait_for_import_batch(app, batch_id, timeout=120)
     finally:
-        executor.shutdown(wait=True)
+        service.shutdown()
 
     with app.state.session_factory() as session:
         batch = session.get(ImportBatch, batch_id)
@@ -574,7 +591,10 @@ def test_1000_import_tests_complete_and_create_one_scan_batch(app):
         scan_batch = session.get(ScanBatch, first_scan_batch_id)
         assert scan_batch.total_tasks == count
 
-    service.resume_pending()
+    service.start()
+    service.shutdown()
+    wait_for_import_batch(app, batch_id)
+    service.shutdown()
 
     with app.state.session_factory() as session:
         batch = session.get(ImportBatch, batch_id)

@@ -1,26 +1,30 @@
+from __future__ import annotations
+
 import logging
+import threading
+import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.collectors.base import Collector, DeviceConnectionSpec
-from app.models import (
-    Device,
-    ImportBatch,
-    ImportBatchStatus,
-    ImportRowResult,
-    ImportTestStatus,
-    OSType,
-)
+from app.models import Device, ImportRowResult, ImportTestStatus, OSType
 from app.security import CredentialCipher, safe_error_message
 from app.services.database_transactions import (
+    DATABASE_UNAVAILABLE_MESSAGE,
     DatabaseUnavailable,
     PostgresTransactionRunner,
     TransactionConflict,
+)
+from app.services.import_test_leases import (
+    IMPORT_TEST_CLAIM_LOCK_KEY,
+    ImportTestLeaseLost,
+    claim_import_tests,
+    refresh_import_batches,
+    renew_import_test_leases,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,135 +51,209 @@ class ImportTestService:
         self,
         session_factory: sessionmaker[Session],
         cipher: CredentialCipher,
-        executor: ThreadPoolExecutor,
+        executor: ThreadPoolExecutor | object | None,
         linux_collector: Collector,
         windows_collector: Collector,
         transaction_runner: PostgresTransactionRunner | Callable[[int], None] | None = None,
         batch_completed_callback: Callable[[int], None] | None = None,
+        *,
+        max_workers: int = 20,
+        global_limit: int = 20,
+        lease_seconds: int = 90,
+        heartbeat_seconds: float = 15,
+        worker_id: str | None = None,
     ) -> None:
-        self.session_factory = session_factory
-        self.cipher = cipher
-        self.executor = executor
-        self.linux_collector = linux_collector
-        self.windows_collector = windows_collector
         if transaction_runner is not None and not isinstance(
             transaction_runner, PostgresTransactionRunner
         ):
             batch_completed_callback = transaction_runner
             transaction_runner = None
+        self.session_factory = session_factory
+        self.cipher = cipher
+        self.linux_collector = linux_collector
+        self.windows_collector = windows_collector
         self.transaction_runner = transaction_runner or PostgresTransactionRunner(
-            session_factory,
-            (0.1, 0.3),
+            session_factory, (0.1, 0.3)
         )
         self.batch_completed_callback = batch_completed_callback
+        self.worker_id = worker_id or str(uuid.uuid4())
+        inferred = getattr(executor, "_max_workers", None)
+        self.max_workers = int(inferred or max_workers)
+        self.global_limit = global_limit
+        self.lease_seconds = lease_seconds
+        self.heartbeat_seconds = heartbeat_seconds
+        self._executor = executor
+        self._owns_executor = executor is None
+        self._dispatcher_thread: threading.Thread | None = None
+        self._heartbeat_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._heartbeat_stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._futures: set[Future] = set()
+        self._futures_lock = threading.Lock()
+        self._active_ids: set[int] = set()
+        self._lost_ids: set[int] = set()
+        self._active_lock = threading.Lock()
+
+    def start(self) -> None:
+        if self._dispatcher_thread is not None:
+            return
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=self.max_workers, thread_name_prefix="import-test"
+            )
+        self._stop_event.clear()
+        self._heartbeat_stop_event.clear()
+        self._dispatcher_thread = threading.Thread(
+            target=self._dispatch_loop, name="import-test-dispatcher", daemon=True
+        )
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, name="import-test-heartbeat", daemon=True
+        )
+        self._heartbeat_thread.start()
+        self._dispatcher_thread.start()
+        self._wake_event.set()
+
+    def shutdown(self) -> None:
+        dispatcher = self._dispatcher_thread
+        if dispatcher is None:
+            return
+        self._stop_event.set()
+        self._wake_event.set()
+        dispatcher.join()
+        if self._owns_executor and isinstance(self._executor, ThreadPoolExecutor):
+            self._executor.shutdown(wait=True, cancel_futures=False)
+            self._executor = None
+        self._heartbeat_stop_event.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join()
+        self._dispatcher_thread = None
+        self._heartbeat_thread = None
 
     def schedule_batch(self, batch_id: int) -> None:
-        with self.session_factory() as session:
-            row_ids = list(
-                session.scalars(
-                    select(ImportRowResult.id).where(
-                        ImportRowResult.batch_id == batch_id,
-                        ImportRowResult.test_status == ImportTestStatus.PENDING,
-                    )
-                ).all()
-            )
-        for row_id in row_ids:
-            self._submit(row_id)
+        del batch_id
+        if self._dispatcher_thread is None and self._executor is not None:
+            self._dispatch_legacy_until_empty()
+        else:
+            self._wake_event.set()
 
     def resume_pending(self) -> None:
-        def recover(session: Session) -> list[int]:
-            running_rows = list(
-                session.scalars(
-                    select(ImportRowResult).where(
-                        ImportRowResult.test_status == ImportTestStatus.RUNNING
-                    )
-                ).all()
-            )
-            affected_batch_ids = {row.batch_id for row in running_rows}
-            for row in running_rows:
-                row.test_status = ImportTestStatus.PENDING
-                row.test_message = None
-            session.flush()
-            for batch_id in affected_batch_ids:
-                self._refresh_batch_counts(session, batch_id)
-            return list(
-                session.scalars(
-                    select(ImportRowResult.id).where(
-                        ImportRowResult.test_status == ImportTestStatus.PENDING
-                    )
-                ).all()
-            )
+        if self._owns_executor:
+            self.start()
+            self._wake_event.set()
+        else:
+            self.schedule_batch(0)
 
-        row_ids = self.transaction_runner.run("recover_import_tests", recover)
-        for row_id in row_ids:
-            self._submit(row_id)
-        if self.batch_completed_callback:
-            with self.session_factory() as session:
-                completed_batch_ids = list(
-                    session.scalars(
-                        select(ImportBatch.id).where(
-                            ImportBatch.status == ImportBatchStatus.COMPLETED,
-                            ImportBatch.scan_batch_id.is_(None),
-                        )
-                    ).all()
-                )
-            for batch_id in completed_batch_ids:
-                self.batch_completed_callback(batch_id)
-
-    def _refresh_batch_counts(self, session: Session, batch_id: int) -> bool:
-        batch = session.scalar(
-            select(ImportBatch).where(ImportBatch.id == batch_id).with_for_update()
+    def _claim(self, capacity: int) -> list[int]:
+        if capacity <= 0:
+            return []
+        return self.transaction_runner.run(
+            "claim_import_tests",
+            lambda session: claim_import_tests(
+                session,
+                self.worker_id,
+                capacity,
+                self.global_limit,
+                self.lease_seconds,
+            ),
         )
-        assert batch is not None
-        was_completed = batch.status == ImportBatchStatus.COMPLETED
 
-        def count(status: ImportTestStatus) -> int:
-            return session.scalar(
+    def _dispatch_legacy_until_empty(self) -> None:
+        while True:
+            row_ids = self._claim(self.max_workers)
+            if not row_ids:
+                return
+            for row_id in row_ids:
+                future = self._executor.submit(self.test_row, row_id)
+                if future is not None and hasattr(future, "add_done_callback"):
+                    future.add_done_callback(self._future_done)
+            if isinstance(self._executor, ThreadPoolExecutor):
+                return
+
+    def _dispatch_loop(self) -> None:
+        while not self._stop_event.is_set():
+            with self._futures_lock:
+                capacity = self.max_workers - len(self._futures)
+            try:
+                row_ids = self._claim(capacity)
+            except (DatabaseUnavailable, TransactionConflict):
+                logger.error("import test claim failed worker_id=%s", self.worker_id)
+                row_ids = []
+            for row_id in row_ids:
+                future = self._executor.submit(self.test_row, row_id)
+                if isinstance(future, Future):
+                    with self._futures_lock:
+                        self._futures.add(future)
+                    future.add_done_callback(self._future_done)
+            if not row_ids:
+                self._wake_event.clear()
+                self._wake_event.wait(0.5)
+
+    def _future_done(self, future: Future) -> None:
+        with self._futures_lock:
+            self._futures.discard(future)
+        if not future.cancelled() and future.exception() is not None:
+            exception = future.exception()
+            if isinstance(exception, (DatabaseUnavailable, TransactionConflict)):
+                logger.error(
+                    "导入连接测试后台数据库操作失败: %s",
+                    DATABASE_UNAVAILABLE_MESSAGE,
+                )
+            else:
+                logger.error(
+                    "import test background failure error_type=%s",
+                    type(exception).__name__,
+                )
+        self._wake_event.set()
+
+    def _claim_specific(self, session: Session, row_id: int):
+        from datetime import timedelta
+
+        now = session.scalar(select(func.now()))
+        row = session.get(ImportRowResult, row_id)
+        if row is not None and row.test_status == ImportTestStatus.PENDING:
+            session.execute(select(func.pg_advisory_xact_lock(IMPORT_TEST_CLAIM_LOCK_KEY)))
+            active = session.scalar(
                 select(func.count()).select_from(ImportRowResult).where(
-                    ImportRowResult.batch_id == batch_id,
-                    ImportRowResult.test_status == status,
+                    ImportRowResult.test_status == ImportTestStatus.RUNNING,
+                    ImportRowResult.test_lease_expires_at > now,
                 )
             ) or 0
+            if active < self.global_limit:
+                row.test_status = ImportTestStatus.RUNNING
+                row.test_message = "正在测试连接"
+                row.test_worker_id = self.worker_id
+                row.test_heartbeat_at = now
+                row.test_lease_expires_at = now + timedelta(seconds=self.lease_seconds)
+                row.test_attempt_count += 1
+                session.flush()
+                refresh_import_batches(session, {row.batch_id})
+        return now
 
-        batch.test_pending_rows = count(ImportTestStatus.PENDING)
-        batch.test_running_rows = count(ImportTestStatus.RUNNING)
-        batch.test_success_rows = count(ImportTestStatus.SUCCESS)
-        batch.test_failed_rows = count(ImportTestStatus.FAILED)
-        if batch.test_pending_rows + batch.test_running_rows == 0:
-            batch.status = ImportBatchStatus.COMPLETED
-            batch.finished_at = datetime.now(timezone.utc)
-        else:
-            batch.status = ImportBatchStatus.TESTING
-            batch.finished_at = None
-        return not was_completed and batch.status == ImportBatchStatus.COMPLETED
-
-    def _load_target(
-        self,
-        row_id: int,
-    ) -> tuple[int, ImportTestTarget | None] | None:
-        def load(session: Session) -> tuple[int, ImportTestTarget | None] | None:
-            row = session.get(ImportRowResult, row_id)
-            if row is None or row.test_status != ImportTestStatus.PENDING:
-                return None
-            batch_id = row.batch_id
-            device = session.get(Device, row.device_id)
-            target = (
-                None
-                if device is None
-                else ImportTestTarget(
-                    device_id=device.id,
-                    os_type=device.os_type,
-                    host=device.host,
-                    port=device.port,
-                    username=device.username,
-                    encrypted_password=device.encrypted_password,
+    def _load_target(self, row_id: int) -> ImportTestTarget | None:
+        def load(session: Session) -> ImportTestTarget | None:
+            now = self._claim_specific(session, row_id)
+            row = session.scalar(
+                select(ImportRowResult).where(
+                    ImportRowResult.id == row_id,
+                    ImportRowResult.test_status == ImportTestStatus.RUNNING,
+                    ImportRowResult.test_worker_id == self.worker_id,
+                    ImportRowResult.test_lease_expires_at > now,
                 )
             )
-            row.test_status = ImportTestStatus.RUNNING
-            row.test_message = "正在测试连接"
-            session.flush()
-            self._refresh_batch_counts(session, batch_id)
-            return batch_id, target
+            if row is None:
+                raise ImportTestLeaseLost(row_id)
+            device = session.get(Device, row.device_id)
+            if device is None:
+                return None
+            return ImportTestTarget(
+                device_id=device.id,
+                os_type=device.os_type,
+                host=device.host,
+                port=device.port,
+                username=device.username,
+                encrypted_password=device.encrypted_password,
+            )
 
         return self.transaction_runner.run("claim_import_test_row", load)
 
@@ -186,9 +264,7 @@ class ImportTestService:
         try:
             password = self.cipher.decrypt(target.encrypted_password)
             collector = (
-                self.linux_collector
-                if target.os_type == OSType.LINUX
-                else self.windows_collector
+                self.linux_collector if target.os_type == OSType.LINUX else self.windows_collector
             )
             collector.test_connection(
                 DeviceConnectionSpec(
@@ -200,69 +276,108 @@ class ImportTestService:
                 password,
             )
             return ImportTestOutcome(ImportTestStatus.SUCCESS, "连接测试成功")
-        except Exception as exc:  # noqa: BLE001 - persist per-device test failure
+        except Exception as exc:  # noqa: BLE001
             return ImportTestOutcome(
-                ImportTestStatus.FAILED,
-                safe_error_message(str(exc), (password,)),
+                ImportTestStatus.FAILED, safe_error_message(str(exc), (password,))
             )
 
-    def _save_result(self, row_id: int, outcome: ImportTestOutcome) -> int | None:
+    def _save_result_for_worker(
+        self,
+        row_id: int,
+        worker_id: str,
+        status: ImportTestStatus,
+        message: str,
+    ) -> int | None:
         def save(session: Session) -> int | None:
-            row = session.get(ImportRowResult, row_id)
-            if row is None or row.test_status not in {
-                ImportTestStatus.PENDING,
-                ImportTestStatus.RUNNING,
-            }:
-                return None
-            row.test_status = outcome.status
-            row.test_message = outcome.message
+            now = session.scalar(select(func.now()))
+            row = session.scalar(
+                select(ImportRowResult)
+                .where(
+                    ImportRowResult.id == row_id,
+                    ImportRowResult.test_status == ImportTestStatus.RUNNING,
+                    ImportRowResult.test_worker_id == worker_id,
+                    ImportRowResult.test_lease_expires_at > now,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise ImportTestLeaseLost(row_id)
+            row.test_status = status
+            row.test_message = message
+            row.test_worker_id = None
+            row.test_lease_expires_at = None
+            row.test_heartbeat_at = None
             session.flush()
-            return row.batch_id if self._refresh_batch_counts(session, row.batch_id) else None
+            completed = refresh_import_batches(session, {row.batch_id})
+            return row.batch_id if row.batch_id in completed else None
 
         return self.transaction_runner.run("save_import_test_result", save)
 
+    def _save_result(self, row_id: int, outcome: ImportTestOutcome) -> int | None:
+        return self._save_result_for_worker(
+            row_id, self.worker_id, outcome.status, outcome.message
+        )
+
     def test_row(self, row_id: int) -> None:
+        with self._active_lock:
+            self._active_ids.add(row_id)
         try:
-            loaded = self._load_target(row_id)
-            if loaded is None:
-                return
-            _, target = loaded
+            target = self._load_target(row_id)
             outcome = self._test_target(target)
-        except (DatabaseUnavailable, TransactionConflict) as exc:
-            logger.error(
-                "导入连接测试数据库操作失败，行记录 %s: %s",
-                row_id,
-                str(exc),
+            with self._active_lock:
+                if row_id in self._lost_ids:
+                    raise ImportTestLeaseLost(row_id)
+            completed = self._save_result(row_id, outcome)
+            if completed is not None and self.batch_completed_callback:
+                self.batch_completed_callback(completed)
+        except ImportTestLeaseLost:
+            logger.info(
+                "import test lease lost row_id=%s worker_id=%s", row_id, self.worker_id
             )
-            return
-        except Exception as exc:  # noqa: BLE001 - persist a sanitized per-row failure
+        except (DatabaseUnavailable, TransactionConflict):
+            logger.error("import test database operation failed row_id=%s", row_id)
+        except Exception as exc:  # noqa: BLE001
             logger.error(
-                "导入连接测试任务发生内部异常，行记录 %s error_type=%s",
+                "import test internal failure row_id=%s error_type=%s",
                 row_id,
                 type(exc).__name__,
             )
-            outcome = ImportTestOutcome(
-                ImportTestStatus.FAILED,
-                f"连接测试内部异常：{safe_error_message(str(exc), ())}",
-            )
-        completed_batch_id = self._save_result(row_id, outcome)
-        if completed_batch_id is not None and self.batch_completed_callback:
-            self.batch_completed_callback(completed_batch_id)
-
-    def _future_done(self, future: Future) -> None:
-        if future.cancelled():
-            return
-        exception = future.exception()
-        if exception is not None:
-            if isinstance(exception, (DatabaseUnavailable, TransactionConflict)):
-                logger.error("导入连接测试后台数据库操作失败: %s", str(exception))
-            else:
-                logger.error(
-                    "导入连接测试后台任务异常 error_type=%s",
-                    type(exception).__name__,
+            try:
+                self.transaction_runner.run(
+                    "claim_failed_import_test_row",
+                    lambda session: self._claim_specific(session, row_id),
                 )
+                self._save_result(
+                    row_id,
+                    ImportTestOutcome(
+                        ImportTestStatus.FAILED,
+                        f"连接测试内部异常：{safe_error_message(str(exc), ())}",
+                    ),
+                )
+            except ImportTestLeaseLost:
+                pass
+        finally:
+            with self._active_lock:
+                self._active_ids.discard(row_id)
+                self._lost_ids.discard(row_id)
 
-    def _submit(self, row_id: int) -> None:
-        future = self.executor.submit(self.test_row, row_id)
-        if future is not None and hasattr(future, "add_done_callback"):
-            future.add_done_callback(self._future_done)
+    def _heartbeat_loop(self) -> None:
+        while not self._heartbeat_stop_event.wait(self.heartbeat_seconds):
+            with self._active_lock:
+                row_ids = set(self._active_ids)
+            if not row_ids:
+                continue
+            try:
+                lost = self.transaction_runner.run(
+                    "renew_import_test_leases",
+                    lambda session, active_ids=row_ids: renew_import_test_leases(
+                        session, self.worker_id, active_ids, self.lease_seconds
+                    ),
+                )
+            except (DatabaseUnavailable, TransactionConflict):
+                logger.error("import test heartbeat failed worker_id=%s", self.worker_id)
+                continue
+            if lost:
+                with self._active_lock:
+                    self._active_ids.difference_update(lost)
+                    self._lost_ids.update(lost)

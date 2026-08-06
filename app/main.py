@@ -1,5 +1,4 @@
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -56,13 +55,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.scan_queue.start()
             if app.state.scheduler:
                 app.state.scheduler.start()
-            app.state.import_test_service.resume_pending()
+            app.state.import_test_service.start()
             try:
                 yield
             finally:
                 if app.state.scheduler:
                     app.state.scheduler.shutdown()
-                app.state.import_executor.shutdown(wait=True, cancel_futures=False)
+                app.state.import_test_service.shutdown()
                 app.state.scan_queue.shutdown()
         finally:
             engine.dispose()
@@ -84,10 +83,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.linux_collector = LinuxCollector(resolved.remote_timeout_seconds)
     app.state.windows_collector = WindowsCollector(resolved.remote_timeout_seconds)
     app.state.topology_cache = TopologyCache(ttl_seconds=30)
-    app.state.import_executor = ThreadPoolExecutor(
-        max_workers=resolved.import_test_max_workers,
-        thread_name_prefix="import-test",
-    )
     app.state.scan_queue = ScanQueueService(
         session_factory,
         cipher,
@@ -103,11 +98,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.import_test_service = ImportTestService(
         session_factory,
         cipher,
-        app.state.import_executor,
+        None,
         app.state.linux_collector,
         app.state.windows_collector,
         transaction_runner,
         app.state.scan_queue.create_import_scan_batch,
+        max_workers=resolved.import_test_max_workers,
+        global_limit=resolved.import_test_max_workers,
+        lease_seconds=resolved.scan_lease_seconds,
+        heartbeat_seconds=resolved.task_heartbeat_seconds,
     )
     app.state.scheduler = (
         SchedulerService(
