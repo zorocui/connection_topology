@@ -20,7 +20,6 @@ from app.services.postgres_notifications import (
     TOPOLOGY_CHANNEL,
     PostgresNotificationListener,
 )
-from app.services.process_guard import SQLiteProcessGuard, sqlite_database_path
 from app.services.scan_queue import ScanQueueService
 from app.services.scheduler import SchedulerService
 from app.services.topology import HostAddressResolver
@@ -36,42 +35,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session_factory,
         max_concurrent_transactions=resolved.db_pool_size + resolved.db_max_overflow,
     )
-    sqlite_process_guard = SQLiteProcessGuard(sqlite_database_path(resolved.database_url))
-
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        sqlite_process_guard.acquire()
-        try:
-            assert_database_current(engine)
-            with (
-                transaction_runner.guard("initialize_settings"),
-                session_factory() as session,
-            ):
-                setting = session.get(SystemSetting, 1)
-                if setting is None:
-                    session.add(
-                        SystemSetting(
-                            id=1,
-                            history_retention_days=resolved.history_retention_days,
-                        )
+        assert_database_current(engine)
+        app.state.migration_current = True
+
+        def initialize_settings(session):
+            setting = session.get(SystemSetting, 1)
+            if setting is None:
+                session.add(
+                    SystemSetting(
+                        id=1,
+                        history_retention_days=resolved.history_retention_days,
                     )
-                    session.commit()
-            app.state.scan_queue.start()
-            app.state.topology_listener.start()
-            if app.state.scheduler:
-                app.state.scheduler.start()
-            app.state.import_test_service.start()
-            try:
-                yield
-            finally:
-                if app.state.scheduler:
-                    app.state.scheduler.shutdown()
-                app.state.import_test_service.shutdown()
-                app.state.scan_queue.shutdown()
-                app.state.topology_listener.shutdown()
+                )
+
+        transaction_runner.run("initialize_settings", initialize_settings)
+        app.state.scan_queue.start()
+        app.state.import_test_service.start()
+        if app.state.scheduler:
+            app.state.scheduler.start()
+        app.state.topology_listener.start()
+        try:
+            yield
         finally:
+            if app.state.scheduler:
+                app.state.scheduler.shutdown()
+            app.state.import_test_service.shutdown()
+            app.state.scan_queue.shutdown()
+            app.state.topology_listener.shutdown()
             engine.dispose()
-            sqlite_process_guard.release()
 
     app = FastAPI(
         title="连接图谱",
@@ -83,7 +76,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.cipher = cipher
-    app.state.sqlite_process_guard = sqlite_process_guard
+    app.state.migration_current = False
     app.state.transaction_runner = transaction_runner
     app.state.address_resolver = HostAddressResolver()
     app.state.linux_collector = LinuxCollector(resolved.remote_timeout_seconds)

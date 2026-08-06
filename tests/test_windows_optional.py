@@ -45,11 +45,11 @@ def test_windows_parser_does_not_require_winrm(monkeypatch):
     assert rows[0].state == "ESTABLISHED"
 
 
-def test_app_creation_does_not_require_winrm(monkeypatch, tmp_path, valid_key):
+def test_app_creation_does_not_require_winrm(monkeypatch, test_database_url, valid_key):
     monkeypatch.setattr(windows, "winrm", None)
     settings = Settings(
         app_secret_key=valid_key,
-        database_url=f"sqlite:///{tmp_path / 'without-winrm.db'}",
+        database_url=test_database_url,
         scheduler_enabled=False,
         _env_file=None,
     )

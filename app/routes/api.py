@@ -6,7 +6,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import Response
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -85,6 +85,19 @@ from app.services.topology_history import (
 
 router = APIRouter(prefix="/api")
 logger = logging.getLogger(__name__)
+
+
+@router.get("/health")
+def health(request: Request):
+    try:
+        with request.app.state.session_factory() as session:
+            session.execute(text("SELECT 1"))
+        if not request.app.state.migration_current:
+            raise RuntimeError("migration not current")
+    except Exception as exc:  # noqa: BLE001 - never expose database driver details
+        logger.warning("health database check failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="数据库不可用") from None
+    return {"database": "ok", "migration": "current"}
 
 
 @contextmanager

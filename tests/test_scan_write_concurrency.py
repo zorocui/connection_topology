@@ -1,6 +1,5 @@
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from sqlalchemy import func, select
@@ -202,18 +201,18 @@ def test_import_test_and_scan_finish_together_without_internal_errors(app):
         session.commit()
         row_id = row.id
 
-    executor = ThreadPoolExecutor(max_workers=1)
     import_service = ImportTestService(
         app.state.session_factory,
         app.state.cipher,
-        executor,
+        None,
         collector,
         collector,
         app.state.transaction_runner,
+        max_workers=1,
     )
     queue.start()
+    import_service.start()
     try:
-        import_service._submit(row_id)
         wait_for_batch(app, scan_batch.id)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
@@ -226,7 +225,7 @@ def test_import_test_and_scan_finish_together_without_internal_errors(app):
             raise AssertionError("导入连接测试未在预期时间内完成")
     finally:
         queue.shutdown()
-        executor.shutdown(wait=True)
+        import_service.shutdown()
 
     with app.state.session_factory() as session:
         task = session.scalar(
@@ -237,5 +236,4 @@ def test_import_test_and_scan_finish_together_without_internal_errors(app):
         assert row.test_status == ImportTestStatus.SUCCESS
         combined = f"{task.error_message or ''} {row.test_message or ''}"
         assert "internal_error" not in combined
-        assert "database is locked" not in combined
         assert "UPDATE devices" not in combined
