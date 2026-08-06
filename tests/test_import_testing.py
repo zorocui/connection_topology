@@ -15,6 +15,10 @@ from app.models import (
     OSType,
     ScanBatch,
 )
+from app.services.database_transactions import (
+    DATABASE_UNAVAILABLE_MESSAGE,
+    DatabaseUnavailable,
+)
 from app.services.import_testing import ImportTestService
 
 
@@ -444,23 +448,41 @@ def test_future_database_exception_is_logged(app, caplog):
         FakeCollector(),
     )
     future = Future()
-    future.set_exception(RuntimeError("database unavailable"))
+    future.set_exception(DatabaseUnavailable("claim_import_test_row"))
 
     service._future_done(future)
 
-    assert "导入连接测试后台任务异常" in caplog.text
-    assert "database unavailable" in caplog.text
+    assert "导入连接测试后台数据库操作失败" in caplog.text
+    assert DATABASE_UNAVAILABLE_MESSAGE in caplog.text
 
 
-def test_import_testing_uses_application_write_coordinator(app, monkeypatch):
+def test_future_exception_log_does_not_include_raw_error_details(app, caplog):
+    service = ImportTestService(
+        app.state.session_factory,
+        app.state.cipher,
+        ImmediateExecutor(),
+        FakeCollector(),
+        FakeCollector(),
+    )
+    future = Future()
+    future.set_exception(RuntimeError("password=RawCredential! database_url=secret"))
+
+    service._future_done(future)
+
+    assert "error_type=RuntimeError" in caplog.text
+    assert "RawCredential!" not in caplog.text
+    assert "database_url=secret" not in caplog.text
+
+
+def test_import_testing_uses_application_transaction_runner(app, monkeypatch):
     names = []
-    original = app.state.sqlite_write_coordinator.write
+    original = app.state.transaction_runner.run
 
     def recording_write(name, operation):
         names.append(name)
         return original(name, operation)
 
-    monkeypatch.setattr(app.state.sqlite_write_coordinator, "write", recording_write)
+    monkeypatch.setattr(app.state.transaction_runner, "run", recording_write)
     _, row_id, _ = seed_pending_row(app, "10.0.0.88")
     app.state.import_test_service.test_row(row_id)
     assert "claim_import_test_row" in names

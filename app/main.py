@@ -15,11 +15,11 @@ from app.database import (
 from app.models import SystemSetting
 from app.routes import api, pages
 from app.security import CredentialCipher, SecretRedactingFilter
+from app.services.database_transactions import PostgresTransactionRunner
 from app.services.import_testing import ImportTestService
 from app.services.process_guard import SQLiteProcessGuard, sqlite_database_path
 from app.services.scan_queue import ScanQueueService
 from app.services.scheduler import SchedulerService
-from app.services.sqlite_writes import SQLiteWriteCoordinator
 from app.services.topology import HostAddressResolver
 from app.services.topology_cache import TopologyCache
 
@@ -29,10 +29,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     engine = create_database_engine(resolved)
     session_factory = create_session_factory(engine)
     cipher = CredentialCipher(resolved.app_secret_key)
-    sqlite_write_coordinator = SQLiteWriteCoordinator(
+    transaction_runner = PostgresTransactionRunner(
         session_factory,
-        (),
-        enabled=engine.dialect.name == "sqlite",
+        max_concurrent_transactions=resolved.db_pool_size + resolved.db_max_overflow,
     )
     sqlite_process_guard = SQLiteProcessGuard(sqlite_database_path(resolved.database_url))
 
@@ -42,7 +41,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             assert_database_current(engine)
             with (
-                sqlite_write_coordinator.write_once("initialize_settings"),
+                transaction_runner.guard("initialize_settings"),
                 session_factory() as session,
             ):
                 setting = session.get(SystemSetting, 1)
@@ -80,7 +79,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.session_factory = session_factory
     app.state.cipher = cipher
     app.state.sqlite_process_guard = sqlite_process_guard
-    app.state.sqlite_write_coordinator = sqlite_write_coordinator
+    app.state.transaction_runner = transaction_runner
     app.state.address_resolver = HostAddressResolver()
     app.state.linux_collector = LinuxCollector(resolved.remote_timeout_seconds)
     app.state.windows_collector = WindowsCollector(resolved.remote_timeout_seconds)
@@ -94,7 +93,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         cipher,
         app.state.linux_collector,
         app.state.windows_collector,
-        sqlite_write_coordinator,
+        transaction_runner,
         max_workers=resolved.scan_max_workers,
         queue_size=resolved.scan_queue_size,
         on_successful_scan=app.state.topology_cache.clear,
@@ -105,7 +104,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.import_executor,
         app.state.linux_collector,
         app.state.windows_collector,
-        sqlite_write_coordinator,
+        transaction_runner,
         app.state.scan_queue.create_import_scan_batch,
     )
     app.state.scheduler = (
@@ -113,7 +112,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             session_factory,
             app.state.scan_queue,
             resolved.scan_jitter_seconds,
-            sqlite_write_coordinator,
+            transaction_runner,
             on_history_purged=app.state.topology_cache.clear,
         )
         if resolved.scheduler_enabled

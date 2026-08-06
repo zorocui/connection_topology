@@ -25,12 +25,13 @@ from app.models import (
     ScanTrigger,
 )
 from app.security import CredentialCipher
-from app.services.scans import ScanOutcome, ScanService, add_scan_outcome
-from app.services.sqlite_writes import (
-    DATABASE_BUSY_MESSAGE,
-    DatabaseBusy,
-    SQLiteWriteCoordinator,
+from app.services.database_transactions import (
+    TRANSACTION_CONFLICT_MESSAGE,
+    DatabaseUnavailable,
+    PostgresTransactionRunner,
+    TransactionConflict,
 )
+from app.services.scans import ScanOutcome, ScanService, add_scan_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,7 @@ class ScanQueueService:
         cipher: CredentialCipher,
         linux_collector: Collector,
         windows_collector: Collector,
-        write_coordinator: SQLiteWriteCoordinator,
+        transaction_runner: PostgresTransactionRunner,
         *,
         max_workers: int,
         queue_size: int,
@@ -74,7 +75,7 @@ class ScanQueueService:
         self.cipher = cipher
         self.linux_collector = linux_collector
         self.windows_collector = windows_collector
-        self.write_coordinator = write_coordinator
+        self.transaction_runner = transaction_runner
         self.scan_service = ScanService(
             session_factory,
             cipher,
@@ -182,7 +183,7 @@ class ScanQueueService:
             return task.id
 
         with self._enqueue_lock:
-            task_id = self.write_coordinator.write("enqueue_scan_device", enqueue)
+            task_id = self.transaction_runner.run("enqueue_scan_device", enqueue)
         with self.session_factory() as session:
             task = session.get(ScanTask, task_id)
             assert task is not None
@@ -266,7 +267,7 @@ class ScanQueueService:
             return batch.id
 
         with self._enqueue_lock:
-            batch_id = self.write_coordinator.write("create_scan_batch", create)
+            batch_id = self.transaction_runner.run("create_scan_batch", create)
         with self.session_factory() as session:
             batch = session.get(ScanBatch, batch_id)
             assert batch is not None
@@ -297,7 +298,7 @@ class ScanQueueService:
             return batch.id
 
         with self._enqueue_lock:
-            batch_id = self.write_coordinator.write("create_import_scan_batch", create)
+            batch_id = self.transaction_runner.run("create_import_scan_batch", create)
         if batch_id is None:
             return None
         with self.session_factory() as session:
@@ -354,7 +355,7 @@ class ScanQueueService:
             return len(tasks)
 
         with self._enqueue_lock:
-            return self.write_coordinator.write("recover_scan_tasks", recover)
+            return self.transaction_runner.run("recover_scan_tasks", recover)
 
     def _claim_tasks(self, limit: int) -> list[int]:
         if limit <= 0:
@@ -382,7 +383,7 @@ class ScanQueueService:
             return [task.id for task in tasks]
 
         with self._claim_lock:
-            return self.write_coordinator.write("claim_scan_tasks", claim)
+            return self.transaction_runner.run("claim_scan_tasks", claim)
 
     def _claim_next_task(self) -> int | None:
         task_ids = self._claim_tasks(1)
@@ -399,15 +400,15 @@ class ScanQueueService:
         outcome = self.scan_service.collect(device_id, trigger)
 
         try:
-            successful = self.write_coordinator.write(
+            successful = self.transaction_runner.run(
                 "persist_scan",
                 lambda session: self._persist_outcome(session, task_id, outcome),
             )
-        except DatabaseBusy:
+        except TransactionConflict:
             try:
-                self._record_database_busy(task_id, outcome)
-            except DatabaseBusy:
-                logger.exception("扫描任务 %s 数据库繁忙状态无法保存", task_id)
+                self._record_transaction_conflict(task_id, outcome)
+            except (DatabaseUnavailable, TransactionConflict):
+                logger.error("扫描任务 %s 事务冲突状态无法保存", task_id)
             return
         if successful and self.on_successful_scan:
             try:
@@ -442,26 +443,36 @@ class ScanQueueService:
             self._refresh_batch(session, batch_id)
         return task.status == ScanTaskStatus.SUCCESS
 
-    def _record_database_busy(self, task_id: int, outcome: ScanOutcome) -> None:
-        busy_outcome = ScanOutcome(
+    def _record_transaction_conflict(self, task_id: int, outcome: ScanOutcome) -> None:
+        conflict_outcome = ScanOutcome(
             device_id=outcome.device_id,
             trigger=outcome.trigger,
             status=ScanStatus.FAILED,
             started_at=outcome.started_at,
             finished_at=datetime.now(timezone.utc),
-            error_code="database_busy",
-            error_message=DATABASE_BUSY_MESSAGE,
+            error_code="transaction_conflict",
+            error_message=TRANSACTION_CONFLICT_MESSAGE,
         )
-        self.write_coordinator.write(
-            "record_database_busy",
-            lambda session: self._persist_outcome(session, task_id, busy_outcome),
+        self.transaction_runner.run(
+            "record_transaction_conflict",
+            lambda session: self._persist_outcome(session, task_id, conflict_outcome),
         )
 
     def _execute_safely(self, task_id: int) -> None:
         try:
             self._execute_task(task_id)
-        except Exception:
-            logger.exception("扫描任务 %s 执行异常", task_id)
+        except (DatabaseUnavailable, TransactionConflict) as exc:
+            logger.error("扫描任务 %s 数据库操作失败: %s", task_id, str(exc))
+            try:
+                self._fail_unexpected_task(task_id)
+            except (DatabaseUnavailable, TransactionConflict):
+                logger.error("扫描任务 %s 失败状态无法保存", task_id)
+        except Exception as exc:  # noqa: BLE001 - convert unexpected worker failure to state
+            logger.error(
+                "扫描任务 %s 执行异常 error_type=%s",
+                task_id,
+                type(exc).__name__,
+            )
             self._fail_unexpected_task(task_id)
 
     def _future_done(self, future: Future) -> None:
@@ -501,7 +512,7 @@ class ScanQueueService:
             for batch_id in batch_ids:
                 self._refresh_batch(session, batch_id)
 
-        self.write_coordinator.write("fail_scan_task", fail)
+        self.transaction_runner.run("fail_scan_task", fail)
 
     def start(self) -> None:
         if self._executor is not None:
@@ -552,4 +563,4 @@ class ScanQueueService:
             return True
 
         with self._enqueue_lock:
-            return self.write_coordinator.write("cancel_scan_device", cancel)
+            return self.transaction_runner.run("cancel_scan_device", cancel)

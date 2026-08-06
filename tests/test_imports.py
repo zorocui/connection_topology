@@ -26,9 +26,9 @@ def workbook_bytes(rows) -> bytes:
     return stream.getvalue()
 
 
-def test_import_transactions_enter_shared_write_once(app, monkeypatch):
+def test_import_transactions_enter_shared_transaction_guard(app, monkeypatch):
     names = []
-    original = app.state.sqlite_write_coordinator.write_once
+    original = app.state.transaction_runner.guard
 
     @contextmanager
     def recording(name):
@@ -36,7 +36,7 @@ def test_import_transactions_enter_shared_write_once(app, monkeypatch):
         with original(name):
             yield
 
-    monkeypatch.setattr(app.state.sqlite_write_coordinator, "write_once", recording)
+    monkeypatch.setattr(app.state.transaction_runner, "guard", recording)
     content = workbook_bytes(
         [("one", "10.0.0.89", "linux", 22, "ops", "secret", "", 5, True)]
     )
@@ -46,7 +46,7 @@ def test_import_transactions_enter_shared_write_once(app, monkeypatch):
             app.state.cipher,
             "devices.xlsx",
             content,
-            app.state.sqlite_write_coordinator,
+            app.state.transaction_runner,
         )
     assert names == [
         "create_import_batch",

@@ -60,9 +60,9 @@ def test_marker_device_has_no_scheduled_job(app):
     assert scheduler.scheduler.get_job("device-scan-100") is None
 
 
-def test_history_purge_enters_shared_write_once(app, monkeypatch):
+def test_history_purge_enters_shared_transaction_guard(app, monkeypatch):
     names = []
-    original = app.state.sqlite_write_coordinator.write_once
+    original = app.state.transaction_runner.guard
 
     @contextmanager
     def recording(name):
@@ -70,12 +70,12 @@ def test_history_purge_enters_shared_write_once(app, monkeypatch):
         with original(name):
             yield
 
-    monkeypatch.setattr(app.state.sqlite_write_coordinator, "write_once", recording)
+    monkeypatch.setattr(app.state.transaction_runner, "guard", recording)
     scheduler = SchedulerService(
         app.state.session_factory,
         RecordingQueue(),
         0,
-        app.state.sqlite_write_coordinator,
+        app.state.transaction_runner,
     )
     scheduler._purge_history()
     assert names == ["purge_history"]

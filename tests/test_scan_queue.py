@@ -20,6 +20,10 @@ from app.models import (
     ScanTaskStatus,
     ScanTrigger,
 )
+from app.services.database_transactions import (
+    TRANSACTION_CONFLICT_MESSAGE,
+    TransactionConflict,
+)
 from app.services.scan_queue import (
     PRIORITY_MANUAL,
     PRIORITY_SCHEDULED,
@@ -27,7 +31,6 @@ from app.services.scan_queue import (
     ScanQueueFull,
     ScanQueueService,
 )
-from app.services.sqlite_writes import DATABASE_BUSY_MESSAGE, DatabaseBusy
 
 
 def make_queue(
@@ -42,7 +45,7 @@ def make_queue(
         app.state.cipher,
         app.state.linux_collector,
         app.state.windows_collector,
-        app.state.sqlite_write_coordinator,
+        app.state.transaction_runner,
         max_workers=max_workers,
         queue_size=queue_size,
         on_successful_scan=on_successful_scan,
@@ -91,15 +94,15 @@ def test_execute_persists_run_device_task_items_and_batch_atomically(app):
         assert persisted_batch.status == ScanBatchStatus.COMPLETED
 
 
-def test_claims_enqueue_and_batch_mutations_use_shared_coordinator(app, monkeypatch):
+def test_claims_enqueue_and_batch_mutations_use_shared_transaction_runner(app, monkeypatch):
     calls = []
-    original = app.state.sqlite_write_coordinator.write
+    original = app.state.transaction_runner.run
 
     def recording_write(name, operation):
         calls.append(name)
         return original(name, operation)
 
-    monkeypatch.setattr(app.state.sqlite_write_coordinator, "write", recording_write)
+    monkeypatch.setattr(app.state.transaction_runner, "run", recording_write)
     device_id = seed_devices(app, 1)[0]
     queue = app.state.scan_queue
     batch = queue.create_batch(ScanBatchType.ALL, [device_id])
@@ -110,19 +113,19 @@ def test_claims_enqueue_and_batch_mutations_use_shared_coordinator(app, monkeypa
     assert task_id
 
 
-def test_persist_retry_exhaustion_records_database_busy(app, monkeypatch):
+def test_persist_retry_exhaustion_records_transaction_conflict(app, monkeypatch):
     device_id = seed_devices(app, 1)[0]
     queue = make_queue(app)
     batch = queue.create_batch(ScanBatchType.ALL, [device_id])
     task_id = queue._claim_next_task()
-    original = queue.write_coordinator.write
+    original = queue.transaction_runner.run
 
     def fail_persist(name, operation):
         if name == "persist_scan":
-            raise DatabaseBusy(name)
+            raise TransactionConflict(name)
         return original(name, operation)
 
-    monkeypatch.setattr(queue.write_coordinator, "write", fail_persist)
+    monkeypatch.setattr(queue.transaction_runner, "run", fail_persist)
     queue._execute_safely(task_id)
 
     with app.state.session_factory() as session:
@@ -130,9 +133,9 @@ def test_persist_retry_exhaustion_records_database_busy(app, monkeypatch):
         run = session.get(ScanRun, task.scan_run_id)
         persisted_batch = session.get(ScanBatch, batch.id)
         assert task.status == ScanTaskStatus.FAILED
-        assert task.error_message == DATABASE_BUSY_MESSAGE
-        assert run.error_code == "database_busy"
-        assert run.error_message == DATABASE_BUSY_MESSAGE
+        assert task.error_message == TRANSACTION_CONFLICT_MESSAGE
+        assert run.error_code == "transaction_conflict"
+        assert run.error_message == TRANSACTION_CONFLICT_MESSAGE
         assert session.scalar(
             select(func.count()).select_from(ConnectionRecord).where(
                 ConnectionRecord.scan_run_id == run.id
@@ -298,7 +301,7 @@ def test_worker_pool_reaches_configured_network_concurrency(app):
         app.state.cipher,
         collector,
         collector,
-        app.state.sqlite_write_coordinator,
+        app.state.transaction_runner,
         max_workers=30,
         queue_size=100,
     )

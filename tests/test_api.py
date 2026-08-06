@@ -1,18 +1,21 @@
 import time
 from contextlib import contextmanager
 
+import pytest
+
 from app.collectors.base import CollectorError
 from app.models import Device, OSType
+from app.services.database_transactions import DatabaseUnavailable, TransactionConflict
 
 
-def test_mutating_routes_enter_shared_write_once(
+def test_mutating_routes_enter_shared_transaction_guard(
     client,
     app,
     linux_device_payload,
     monkeypatch,
 ):
     names = []
-    original = app.state.sqlite_write_coordinator.write_once
+    original = app.state.transaction_runner.guard
 
     @contextmanager
     def recording(name):
@@ -20,7 +23,7 @@ def test_mutating_routes_enter_shared_write_once(
         with original(name):
             yield
 
-    monkeypatch.setattr(app.state.sqlite_write_coordinator, "write_once", recording)
+    monkeypatch.setattr(app.state.transaction_runner, "guard", recording)
     assert client.post("/api/clusters", json={"name": "coordinated"}).status_code == 201
     assert client.post("/api/devices", json=linux_device_payload).status_code == 201
     assert client.put(
@@ -32,6 +35,24 @@ def test_mutating_routes_enter_shared_write_once(
         "api_create_device",
         "api_update_settings",
     } <= set(names)
+
+
+@pytest.mark.parametrize("error_type", [DatabaseUnavailable, TransactionConflict])
+def test_mutating_route_maps_safe_database_errors_to_503(
+    client,
+    app,
+    monkeypatch,
+    error_type,
+):
+    @contextmanager
+    def failing_guard(operation_name):
+        raise error_type(operation_name)
+        yield
+
+    monkeypatch.setattr(app.state.transaction_runner, "guard", failing_guard)
+    response = client.post("/api/clusters", json={"name": "unavailable"})
+    assert response.status_code == 503
+    assert response.json() == {"detail": str(error_type("api_create_cluster"))}
 
 
 def seed_marker_device(app, *, host):

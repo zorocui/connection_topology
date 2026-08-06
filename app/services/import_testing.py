@@ -17,7 +17,11 @@ from app.models import (
     OSType,
 )
 from app.security import CredentialCipher, safe_error_message
-from app.services.sqlite_writes import SQLiteWriteCoordinator
+from app.services.database_transactions import (
+    DatabaseUnavailable,
+    PostgresTransactionRunner,
+    TransactionConflict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +50,7 @@ class ImportTestService:
         executor: ThreadPoolExecutor,
         linux_collector: Collector,
         windows_collector: Collector,
-        write_coordinator: SQLiteWriteCoordinator | Callable[[int], None] | None = None,
+        transaction_runner: PostgresTransactionRunner | Callable[[int], None] | None = None,
         batch_completed_callback: Callable[[int], None] | None = None,
     ) -> None:
         self.session_factory = session_factory
@@ -54,12 +58,12 @@ class ImportTestService:
         self.executor = executor
         self.linux_collector = linux_collector
         self.windows_collector = windows_collector
-        if write_coordinator is not None and not isinstance(
-            write_coordinator, SQLiteWriteCoordinator
+        if transaction_runner is not None and not isinstance(
+            transaction_runner, PostgresTransactionRunner
         ):
-            batch_completed_callback = write_coordinator
-            write_coordinator = None
-        self.write_coordinator = write_coordinator or SQLiteWriteCoordinator(
+            batch_completed_callback = transaction_runner
+            transaction_runner = None
+        self.transaction_runner = transaction_runner or PostgresTransactionRunner(
             session_factory,
             (0.1, 0.3),
         )
@@ -102,7 +106,7 @@ class ImportTestService:
                 ).all()
             )
 
-        row_ids = self.write_coordinator.write("recover_import_tests", recover)
+        row_ids = self.transaction_runner.run("recover_import_tests", recover)
         for row_id in row_ids:
             self._submit(row_id)
         if self.batch_completed_callback:
@@ -171,7 +175,7 @@ class ImportTestService:
             self._refresh_batch_counts(session, batch_id)
             return batch_id, target
 
-        return self.write_coordinator.write("claim_import_test_row", load)
+        return self.transaction_runner.run("claim_import_test_row", load)
 
     def _test_target(self, target: ImportTestTarget | None) -> ImportTestOutcome:
         if target is None:
@@ -213,7 +217,7 @@ class ImportTestService:
             session.flush()
             return row.batch_id if self._refresh_batch_counts(session, row.batch_id) else None
 
-        return self.write_coordinator.write("save_import_test_result", save)
+        return self.transaction_runner.run("save_import_test_result", save)
 
     def test_row(self, row_id: int) -> None:
         try:
@@ -222,8 +226,19 @@ class ImportTestService:
                 return
             _, target = loaded
             outcome = self._test_target(target)
-        except Exception as exc:
-            logger.exception("导入连接测试任务发生内部异常，行记录 %s", row_id)
+        except (DatabaseUnavailable, TransactionConflict) as exc:
+            logger.error(
+                "导入连接测试数据库操作失败，行记录 %s: %s",
+                row_id,
+                str(exc),
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - persist a sanitized per-row failure
+            logger.error(
+                "导入连接测试任务发生内部异常，行记录 %s error_type=%s",
+                row_id,
+                type(exc).__name__,
+            )
             outcome = ImportTestOutcome(
                 ImportTestStatus.FAILED,
                 f"连接测试内部异常：{safe_error_message(str(exc), ())}",
@@ -237,10 +252,13 @@ class ImportTestService:
             return
         exception = future.exception()
         if exception is not None:
-            logger.error(
-                "导入连接测试后台任务异常",
-                exc_info=(type(exception), exception, exception.__traceback__),
-            )
+            if isinstance(exception, (DatabaseUnavailable, TransactionConflict)):
+                logger.error("导入连接测试后台数据库操作失败: %s", str(exception))
+            else:
+                logger.error(
+                    "导入连接测试后台任务异常 error_type=%s",
+                    type(exception).__name__,
+                )
 
     def _submit(self, row_id: int) -> None:
         future = self.executor.submit(self.test_row, row_id)

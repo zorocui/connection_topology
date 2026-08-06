@@ -9,7 +9,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.datavalidation import DataValidation
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError, TimeoutError
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from app.models import (
@@ -27,7 +27,7 @@ from app.services.clusters import (
     create_cluster,
     find_cluster_by_name,
 )
-from app.services.sqlite_writes import SQLiteWriteCoordinator
+from app.services.database_transactions import PostgresTransactionRunner
 
 MAX_IMPORT_BYTES = 5 * 1024 * 1024
 MAX_IMPORT_ROWS = 1000
@@ -226,9 +226,9 @@ def import_devices(
     cipher: CredentialCipher,
     filename: str,
     content: bytes,
-    write_coordinator: SQLiteWriteCoordinator | None = None,
+    transaction_runner: PostgresTransactionRunner | None = None,
 ) -> ImportBatch:
-    write_coordinator = write_coordinator or SQLiteWriteCoordinator(
+    transaction_runner = transaction_runner or PostgresTransactionRunner(
         sessionmaker(bind=session.get_bind(), autoflush=False, expire_on_commit=False),
         (0.1, 0.3),
     )
@@ -238,152 +238,153 @@ def import_devices(
         status=ImportBatchStatus.IMPORTING,
         total_rows=len(rows),
     )
-    with write_coordinator.write_once("create_import_batch"):
+    with transaction_runner.guard("create_import_batch"):
         session.add(batch)
         session.commit()
         session.refresh(batch)
 
     for row_number, values in rows:
-        row_guard = write_coordinator.write_once("import_device_row")
-        row_guard.__enter__()
-        device_name = None
-        host = None
-        try:
-            parsed = _parse_row(values)
-            device_name = parsed["name"]
-            host = parsed["host"]
-            duplicate = session.scalar(
-                select(Device).where(
-                    Device.host == parsed["host"],
-                    Device.port == parsed["port"],
-                    Device.username == parsed["username"],
+        with transaction_runner.guard("import_device_row"):
+            device_name = None
+            host = None
+            try:
+                parsed = _parse_row(values)
+                device_name = parsed["name"]
+                host = parsed["host"]
+                duplicate = session.scalar(
+                    select(Device).where(
+                        Device.host == parsed["host"],
+                        Device.port == parsed["port"],
+                        Device.username == parsed["username"],
+                    )
                 )
-            )
-            if duplicate:
-                if not parsed["password"]:
-                    message = "设备已存在，未修改集群归属"
-                    session.add(
-                        ImportRowResult(
-                            batch_id=batch.id,
-                            row_number=row_number,
-                            device_name=device_name,
-                            host=host,
-                            device_id=duplicate.id,
-                            import_status=ImportStatus.ERROR,
-                            import_message=message,
-                            test_status=ImportTestStatus.NOT_APPLICABLE,
+                if duplicate:
+                    if not parsed["password"]:
+                        message = "设备已存在，未修改集群归属"
+                        session.add(
+                            ImportRowResult(
+                                batch_id=batch.id,
+                                row_number=row_number,
+                                device_name=device_name,
+                                host=host,
+                                device_id=duplicate.id,
+                                import_status=ImportStatus.ERROR,
+                                import_message=message,
+                                test_status=ImportTestStatus.NOT_APPLICABLE,
+                            )
                         )
-                    )
-                    batch.error_rows += 1
-                    logger.warning(
-                        "集群标注导入冲突 batch_id=%s row=%s name=%s host=%s "
-                        "port=%s username=%s reason=%s",
-                        batch.id,
-                        row_number,
-                        parsed["name"],
-                        parsed["host"],
-                        parsed["port"],
-                        parsed["username"],
-                        message,
-                    )
-                else:
-                    session.add(
-                        ImportRowResult(
-                            batch_id=batch.id,
-                            row_number=row_number,
-                            device_name=device_name,
-                            host=host,
-                            device_id=duplicate.id,
-                            import_status=ImportStatus.SKIPPED,
-                            import_message="设备已存在，已跳过",
-                            test_status=ImportTestStatus.NOT_APPLICABLE,
+                        batch.error_rows += 1
+                        logger.warning(
+                            "集群标注导入冲突 batch_id=%s row=%s name=%s host=%s "
+                            "port=%s username=%s reason=%s",
+                            batch.id,
+                            row_number,
+                            parsed["name"],
+                            parsed["host"],
+                            parsed["port"],
+                            parsed["username"],
+                            message,
                         )
+                    else:
+                        session.add(
+                            ImportRowResult(
+                                batch_id=batch.id,
+                                row_number=row_number,
+                                device_name=device_name,
+                                host=host,
+                                device_id=duplicate.id,
+                                import_status=ImportStatus.SKIPPED,
+                                import_message="设备已存在，已跳过",
+                                test_status=ImportTestStatus.NOT_APPLICABLE,
+                            )
+                        )
+                        batch.skipped_rows += 1
+                    session.commit()
+                    continue
+                cluster = None
+                if parsed["cluster_name"]:
+                    cluster = find_cluster_by_name(session, parsed["cluster_name"])
+                    if cluster is None:
+                        cluster = create_cluster(
+                            session,
+                            parsed["cluster_name"],
+                            scan_interval_minutes=parsed["scan_interval_minutes"],
+                            scheduled_enabled=parsed["scheduled_enabled"],
+                        )
+                scan_interval, scheduled_enabled = cluster_scan_values(
+                    cluster,
+                    parsed["scan_interval_minutes"],
+                    parsed["scheduled_enabled"],
+                )
+                collection_enabled = bool(parsed["password"])
+                test_status = (
+                    ImportTestStatus.PENDING
+                    if collection_enabled
+                    else ImportTestStatus.NOT_APPLICABLE
+                )
+                import_message = (
+                    "导入成功，等待连接测试"
+                    if collection_enabled
+                    else "仅标注集群设备，不执行连接测试"
+                )
+                device = Device(
+                    name=parsed["name"],
+                    host=parsed["host"],
+                    os_type=parsed["os_type"],
+                    port=parsed["port"],
+                    username=parsed["username"],
+                    encrypted_password=cipher.encrypt(parsed["password"]),
+                    collection_enabled=collection_enabled,
+                    cluster_id=cluster.id if cluster else None,
+                    scan_interval_minutes=scan_interval,
+                    scheduled_enabled=scheduled_enabled,
+                )
+                session.add(device)
+                session.flush()
+                session.add(
+                    ImportRowResult(
+                        batch_id=batch.id,
+                        row_number=row_number,
+                        device_name=device_name,
+                        host=host,
+                        device_id=device.id,
+                        import_status=ImportStatus.IMPORTED,
+                        import_message=import_message,
+                        test_status=test_status,
                     )
-                    batch.skipped_rows += 1
+                )
+                batch.imported_rows += 1
+                if collection_enabled:
+                    batch.test_pending_rows += 1
                 session.commit()
-                row_guard.__exit__(None, None, None)
-                continue
-            cluster = None
-            if parsed["cluster_name"]:
-                cluster = find_cluster_by_name(session, parsed["cluster_name"])
-                if cluster is None:
-                    cluster = create_cluster(
-                        session,
-                        parsed["cluster_name"],
-                        scan_interval_minutes=parsed["scan_interval_minutes"],
-                        scheduled_enabled=parsed["scheduled_enabled"],
+            except Exception as exc:
+                session.rollback()
+                if isinstance(exc, (DBAPIError, TimeoutError)) and not isinstance(
+                    exc, IntegrityError
+                ):
+                    raise
+                batch = session.get(ImportBatch, batch.id)
+                assert batch is not None
+                batch.error_rows += 1
+                if isinstance(exc, ImportValidationError):
+                    message = str(exc)
+                elif isinstance(exc, IntegrityError):
+                    message = "数据库写入冲突"
+                else:
+                    message = "该行导入失败"
+                session.add(
+                    ImportRowResult(
+                        batch_id=batch.id,
+                        row_number=row_number,
+                        device_name=device_name,
+                        host=host,
+                        import_status=ImportStatus.ERROR,
+                        import_message=message,
+                        test_status=ImportTestStatus.NOT_APPLICABLE,
                     )
-            scan_interval, scheduled_enabled = cluster_scan_values(
-                cluster,
-                parsed["scan_interval_minutes"],
-                parsed["scheduled_enabled"],
-            )
-            collection_enabled = bool(parsed["password"])
-            test_status = (
-                ImportTestStatus.PENDING
-                if collection_enabled
-                else ImportTestStatus.NOT_APPLICABLE
-            )
-            import_message = (
-                "导入成功，等待连接测试"
-                if collection_enabled
-                else "仅标注集群设备，不执行连接测试"
-            )
-            device = Device(
-                name=parsed["name"],
-                host=parsed["host"],
-                os_type=parsed["os_type"],
-                port=parsed["port"],
-                username=parsed["username"],
-                encrypted_password=cipher.encrypt(parsed["password"]),
-                collection_enabled=collection_enabled,
-                cluster_id=cluster.id if cluster else None,
-                scan_interval_minutes=scan_interval,
-                scheduled_enabled=scheduled_enabled,
-            )
-            session.add(device)
-            session.flush()
-            session.add(
-                ImportRowResult(
-                    batch_id=batch.id,
-                    row_number=row_number,
-                    device_name=device_name,
-                    host=host,
-                    device_id=device.id,
-                    import_status=ImportStatus.IMPORTED,
-                    import_message=import_message,
-                    test_status=test_status,
                 )
-            )
-            batch.imported_rows += 1
-            if collection_enabled:
-                batch.test_pending_rows += 1
-            session.commit()
-        except Exception as exc:  # noqa: BLE001 - every workbook row is isolated
-            session.rollback()
-            batch = session.get(ImportBatch, batch.id)
-            assert batch is not None
-            batch.error_rows += 1
-            if isinstance(exc, ImportValidationError):
-                message = str(exc)
-            elif isinstance(exc, IntegrityError):
-                message = "数据库写入冲突"
-            else:
-                message = "该行导入失败"
-            session.add(
-                ImportRowResult(
-                    batch_id=batch.id,
-                    row_number=row_number,
-                    device_name=device_name,
-                    host=host,
-                    import_status=ImportStatus.ERROR,
-                    import_message=message,
-                    test_status=ImportTestStatus.NOT_APPLICABLE,
-                )
-            )
-            session.commit()
-        row_guard.__exit__(None, None, None)
-    with write_coordinator.write_once("finish_import_batch"):
+                session.commit()
+    with transaction_runner.guard("finish_import_batch"):
         batch = session.get(ImportBatch, batch.id)
         assert batch is not None
         batch.status = (

@@ -55,6 +55,7 @@ from app.services.clusters import (
     replace_internal_networks,
     resolve_cluster,
 )
+from app.services.database_transactions import DatabaseUnavailable, TransactionConflict
 from app.services.imports import (
     MAX_IMPORT_BYTES,
     ImportValidationError,
@@ -74,7 +75,6 @@ from app.services.scan_queue import (
     ScanQueueFull,
 )
 from app.services.scans import ScanService
-from app.services.sqlite_writes import DatabaseBusy
 from app.services.topology import build_cluster_topology, build_topology, diff_scans
 from app.services.topology_history import (
     TopologyWindow,
@@ -89,9 +89,9 @@ logger = logging.getLogger(__name__)
 @contextmanager
 def _write_request(request: Request, operation_name: str):
     try:
-        with request.app.state.sqlite_write_coordinator.write_once(operation_name):
+        with request.app.state.transaction_runner.guard(operation_name):
             yield
-    except DatabaseBusy as exc:
+    except (DatabaseUnavailable, TransactionConflict) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
@@ -196,11 +196,11 @@ async def upload_import(
             request.app.state.cipher,
             file.filename or "import.xlsx",
             content,
-            request.app.state.sqlite_write_coordinator,
+            request.app.state.transaction_runner,
         )
     except ImportValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except DatabaseBusy as exc:
+    except (DatabaseUnavailable, TransactionConflict) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     imported_rows = db.scalars(
         select(ImportRowResult).where(

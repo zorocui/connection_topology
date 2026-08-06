@@ -82,7 +82,7 @@ def make_queue(app, collector, workers):
         app.state.cipher,
         collector,
         collector,
-        app.state.sqlite_write_coordinator,
+        app.state.transaction_runner,
         max_workers=workers,
         queue_size=200,
     )
@@ -129,8 +129,12 @@ def test_thirty_simultaneous_collections_persist_without_lock_failures(app):
         ) == 30
 
 
-def transient_locked_error():
-    return OperationalError("INSERT INTO scan_runs", (), Exception("database is locked"))
+class RetryableDriverError(Exception):
+    sqlstate = "40001"
+
+
+def transient_transaction_error():
+    return OperationalError("INSERT INTO scan_runs", (), RetryableDriverError())
 
 
 def test_persist_retry_rebuilds_rows_without_duplicates(app, monkeypatch):
@@ -138,7 +142,7 @@ def test_persist_retry_rebuilds_rows_without_duplicates(app, monkeypatch):
     queue = make_queue(app, BarrierCollector(1), 1)
     batch = queue.create_batch(ScanBatchType.ALL, [device_id])
     task_id = queue._claim_next_task()
-    original_write = app.state.sqlite_write_coordinator.write
+    original_write = app.state.transaction_runner.run
     persist_attempts = 0
 
     def flaky_write(name, operation):
@@ -150,12 +154,12 @@ def test_persist_retry_rebuilds_rows_without_duplicates(app, monkeypatch):
             persist_attempts += 1
             result = operation(session)
             if persist_attempts < 3:
-                raise transient_locked_error()
+                raise transient_transaction_error()
             return result
 
         return original_write(name, flaky_operation)
 
-    monkeypatch.setattr(app.state.sqlite_write_coordinator, "write", flaky_write)
+    monkeypatch.setattr(app.state.transaction_runner, "run", flaky_write)
     queue._execute_task(task_id)
 
     with app.state.session_factory() as session:
@@ -174,7 +178,7 @@ def test_import_test_and_scan_finish_together_without_internal_errors(app):
     scan_batch = queue.create_batch(ScanBatchType.ALL, [device_ids[0]])
 
     with (
-        app.state.sqlite_write_coordinator.write_once("seed_import_test"),
+        app.state.transaction_runner.guard("seed_import_test"),
         app.state.session_factory() as session,
     ):
         import_batch = ImportBatch(
@@ -205,7 +209,7 @@ def test_import_test_and_scan_finish_together_without_internal_errors(app):
         executor,
         collector,
         collector,
-        app.state.sqlite_write_coordinator,
+        app.state.transaction_runner,
     )
     queue.start()
     try:

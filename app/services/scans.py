@@ -193,11 +193,13 @@ class ScanService:
                     error_code=exc.code,
                     error_message=message,
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - persist a sanitized collection failure
                 message = safe_error_message(str(exc), (password,))
-                logger.exception(
-                    "设备 %s 采集发生内部错误，详情已写入脱敏批次记录",
+                logger.error(
+                    "设备 %s 采集发生内部错误，详情已写入脱敏批次记录 "
+                    "error_type=%s",
                     device_id,
+                    type(exc).__name__,
                 )
                 return ScanOutcome(
                     device_id=device_id,
