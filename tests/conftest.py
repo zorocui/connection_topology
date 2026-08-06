@@ -5,6 +5,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from cryptography.fernet import Fernet
+from pydantic import ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
@@ -39,11 +40,18 @@ def _assert_test_database_url(database_url: str) -> None:
         raise RuntimeError("Refusing to use a test database other than connection_topology_test")
 
 
-@pytest.fixture(scope="session")
-def test_database_url() -> str:
-    database_url = TestDatabaseSettings().test_database_url
+def _load_test_database_url(*, env_file: str | None = ".env") -> str:
+    try:
+        database_url = TestDatabaseSettings(_env_file=env_file).test_database_url
+    except ValidationError as exc:
+        raise RuntimeError("TEST_DATABASE_URL is required for PostgreSQL tests") from exc
     _assert_test_database_url(database_url)
     return database_url
+
+
+@pytest.fixture(scope="session")
+def test_database_url() -> str:
+    return _load_test_database_url()
 
 
 @pytest.fixture(scope="session")
