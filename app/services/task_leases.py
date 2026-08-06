@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -15,6 +15,14 @@ from app.models import (
 )
 
 SCAN_CLAIM_LOCK_KEY = 740_001
+
+
+class TaskLeaseLost(RuntimeError):
+    """Raised when a worker no longer owns a live scan-task lease."""
+
+    def __init__(self, task_id: int) -> None:
+        self.task_id = task_id
+        super().__init__(f"scan task lease lost: {task_id}")
 
 
 def refresh_scan_batches(session: Session, batch_ids: Iterable[int]) -> None:
@@ -133,3 +141,35 @@ def claim_scan_tasks(
     session.flush()
     refresh_scan_batches(session, changed_batch_ids)
     return [task.id for task in tasks]
+
+
+def renew_scan_leases(
+    session: Session,
+    worker_id: str,
+    task_ids: Iterable[int],
+    lease_seconds: float,
+) -> set[int]:
+    """Renew live leases owned by ``worker_id`` and return IDs no longer owned."""
+    requested_ids = set(task_ids)
+    if not requested_ids:
+        return set()
+
+    now = session.scalar(select(func.now()))
+    assert now is not None
+    renewed_ids = set(
+        session.scalars(
+            update(ScanTask)
+            .where(
+                ScanTask.id.in_(requested_ids),
+                ScanTask.status == ScanTaskStatus.RUNNING,
+                ScanTask.worker_id == worker_id,
+                ScanTask.lease_expires_at > now,
+            )
+            .values(
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=lease_seconds),
+            )
+            .returning(ScanTask.id)
+        ).all()
+    )
+    return requested_ids - renewed_ids

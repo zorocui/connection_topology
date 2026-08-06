@@ -33,7 +33,12 @@ from app.services.database_transactions import (
     TransactionConflict,
 )
 from app.services.scans import ScanOutcome, ScanService, add_scan_outcome
-from app.services.task_leases import claim_scan_tasks, refresh_scan_batches
+from app.services.task_leases import (
+    TaskLeaseLost,
+    claim_scan_tasks,
+    refresh_scan_batches,
+    renew_scan_leases,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +76,8 @@ class ScanQueueService:
         *,
         max_workers: int,
         queue_size: int,
-        lease_seconds: int = 90,
+        lease_seconds: float = 90,
+        heartbeat_seconds: float = 15,
         on_successful_scan: Callable[[], None] | None = None,
     ) -> None:
         self.session_factory = session_factory
@@ -88,15 +94,21 @@ class ScanQueueService:
         self.max_workers = max_workers
         self.queue_size = queue_size
         self.lease_seconds = lease_seconds
+        self.task_heartbeat_seconds = heartbeat_seconds
         self.worker_id = uuid.uuid4().hex
         self.on_successful_scan = on_successful_scan
         self._enqueue_lock = threading.RLock()
         self._wake_event = threading.Event()
         self._stop_event = threading.Event()
+        self._heartbeat_stop_event = threading.Event()
         self._executor: ThreadPoolExecutor | None = None
         self._dispatcher_thread: threading.Thread | None = None
+        self._heartbeat_thread: threading.Thread | None = None
         self._futures: set[Future] = set()
         self._futures_lock = threading.Lock()
+        self._active_task_ids: set[int] = set()
+        self._lost_task_ids: set[int] = set()
+        self._active_tasks_lock = threading.Lock()
 
     def _active_task(self, session: Session, device_id: int) -> ScanTask | None:
         return session.scalar(
@@ -315,7 +327,7 @@ class ScanQueueService:
         refresh_scan_batches(session, {batch_id})
 
     def _claim_tasks(self, limit: int) -> list[int]:
-        return self.transaction_runner.run(
+        task_ids = self.transaction_runner.run(
             "claim_scan_tasks",
             lambda session: claim_scan_tasks(
                 session,
@@ -325,37 +337,53 @@ class ScanQueueService:
                 self.lease_seconds,
             ),
         )
+        if task_ids:
+            with self._active_tasks_lock:
+                self._active_task_ids.update(task_ids)
+                self._lost_task_ids.difference_update(task_ids)
+        return task_ids
 
     def _claim_next_task(self) -> int | None:
         task_ids = self._claim_tasks(1)
         return task_ids[0] if task_ids else None
 
     def _execute_task(self, task_id: int) -> None:
-        with self.session_factory() as session:
-            task = session.get(ScanTask, task_id)
-            if task is None or task.status != ScanTaskStatus.RUNNING:
-                return
-            device_id = task.device_id
-            trigger = task.trigger_type
-
-        outcome = self.scan_service.collect(device_id, trigger)
-
         try:
-            successful = self.transaction_runner.run(
-                "persist_scan",
-                lambda session: self._persist_outcome(session, task_id, outcome),
-            )
-        except TransactionConflict:
+            with self.session_factory() as session:
+                task = session.scalar(
+                    select(ScanTask).where(
+                        ScanTask.id == task_id,
+                        ScanTask.status == ScanTaskStatus.RUNNING,
+                        ScanTask.worker_id == self.worker_id,
+                        ScanTask.lease_expires_at > func.now(),
+                    )
+                )
+                if task is None:
+                    raise TaskLeaseLost(task_id)
+                device_id = task.device_id
+                trigger = task.trigger_type
+
+            outcome = self.scan_service.collect(device_id, trigger)
+            self._raise_if_lease_lost(task_id)
+
             try:
-                self._record_transaction_conflict(task_id, outcome)
-            except (DatabaseUnavailable, TransactionConflict):
-                logger.error("扫描任务 %s 事务冲突状态无法保存", task_id)
-            return
-        if successful and self.on_successful_scan:
-            try:
-                self.on_successful_scan()
-            except Exception:
-                logger.exception("历史拓扑缓存失效失败")
+                successful = self.transaction_runner.run(
+                    "persist_scan",
+                    lambda session: self._persist_outcome(session, task_id, outcome),
+                )
+            except TransactionConflict:
+                try:
+                    self._record_transaction_conflict(task_id, outcome)
+                except (DatabaseUnavailable, TransactionConflict):
+                    logger.error("扫描任务 %s 事务冲突状态无法保存", task_id)
+                return
+            if successful and self.on_successful_scan:
+                try:
+                    self.on_successful_scan()
+                except Exception:
+                    logger.exception("历史拓扑缓存失效失败")
+        finally:
+            self._release_active_task(task_id)
 
     def _persist_outcome(
         self,
@@ -363,9 +391,18 @@ class ScanQueueService:
         task_id: int,
         outcome: ScanOutcome,
     ) -> bool:
-        task = session.get(ScanTask, task_id)
-        if task is None or task.status != ScanTaskStatus.RUNNING:
-            return False
+        task = session.scalar(
+            select(ScanTask)
+            .where(
+                ScanTask.id == task_id,
+                ScanTask.status == ScanTaskStatus.RUNNING,
+                ScanTask.worker_id == self.worker_id,
+                ScanTask.lease_expires_at > func.now(),
+            )
+            .with_for_update()
+        )
+        if task is None:
+            raise TaskLeaseLost(task_id)
         run = add_scan_outcome(session, outcome)
         task.scan_run_id = run.id
         task.finished_at = outcome.finished_at
@@ -375,6 +412,9 @@ class ScanQueueService:
             if outcome.status == ScanStatus.SUCCESS
             else ScanTaskStatus.FAILED
         )
+        task.worker_id = None
+        task.lease_expires_at = None
+        task.heartbeat_at = None
         batch_ids: set[int] = set()
         for item in task.items:
             item.status = task.status
@@ -402,10 +442,14 @@ class ScanQueueService:
     def _execute_safely(self, task_id: int) -> None:
         try:
             self._execute_task(task_id)
+        except TaskLeaseLost:
+            self._log_lease_lost(task_id)
         except (DatabaseUnavailable, TransactionConflict) as exc:
             logger.error("扫描任务 %s 数据库操作失败: %s", task_id, str(exc))
             try:
                 self._fail_unexpected_task(task_id)
+            except TaskLeaseLost:
+                self._log_lease_lost(task_id)
             except (DatabaseUnavailable, TransactionConflict):
                 logger.error("扫描任务 %s 失败状态无法保存", task_id)
         except Exception as exc:  # noqa: BLE001 - convert unexpected worker failure to state
@@ -414,7 +458,63 @@ class ScanQueueService:
                 task_id,
                 type(exc).__name__,
             )
-            self._fail_unexpected_task(task_id)
+            try:
+                self._fail_unexpected_task(task_id)
+            except TaskLeaseLost:
+                self._log_lease_lost(task_id)
+            except (DatabaseUnavailable, TransactionConflict):
+                logger.error("扫描任务 %s 失败状态无法保存", task_id)
+
+    def _log_lease_lost(self, task_id: int) -> None:
+        logger.info(
+            "scan lease lost operation=execute_scan task_id=%s worker_id=%s",
+            task_id,
+            self.worker_id,
+        )
+
+    def _raise_if_lease_lost(self, task_id: int) -> None:
+        with self._active_tasks_lock:
+            if task_id in self._lost_task_ids:
+                raise TaskLeaseLost(task_id)
+
+    def _release_active_task(self, task_id: int) -> None:
+        with self._active_tasks_lock:
+            self._active_task_ids.discard(task_id)
+            self._lost_task_ids.discard(task_id)
+
+    def _heartbeat_loop(self) -> None:
+        while not self._heartbeat_stop_event.wait(self.task_heartbeat_seconds):
+            with self._active_tasks_lock:
+                task_ids = set(self._active_task_ids)
+            if not task_ids:
+                continue
+            try:
+                lost_ids = self.transaction_runner.run(
+                    "renew_scan_leases",
+                    lambda session, active_ids=task_ids: renew_scan_leases(
+                        session,
+                        self.worker_id,
+                        active_ids,
+                        self.lease_seconds,
+                    ),
+                )
+            except (DatabaseUnavailable, TransactionConflict):
+                logger.error(
+                    "scan lease heartbeat failed worker_id=%s",
+                    self.worker_id,
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001 - keep the shared heartbeat alive
+                logger.error(
+                    "scan lease heartbeat failed worker_id=%s error_type=%s",
+                    self.worker_id,
+                    type(exc).__name__,
+                )
+                continue
+            if lost_ids:
+                with self._active_tasks_lock:
+                    self._active_task_ids.difference_update(lost_ids)
+                    self._lost_task_ids.update(lost_ids)
 
     def _future_done(self, future: Future) -> None:
         with self._futures_lock:
@@ -439,12 +539,24 @@ class ScanQueueService:
 
     def _fail_unexpected_task(self, task_id: int) -> None:
         def fail(session: Session) -> None:
-            task = session.get(ScanTask, task_id)
-            if task is None or task.status not in ACTIVE_TASK_STATUSES:
-                return
+            task = session.scalar(
+                select(ScanTask)
+                .where(
+                    ScanTask.id == task_id,
+                    ScanTask.status == ScanTaskStatus.RUNNING,
+                    ScanTask.worker_id == self.worker_id,
+                    ScanTask.lease_expires_at > func.now(),
+                )
+                .with_for_update()
+            )
+            if task is None:
+                raise TaskLeaseLost(task_id)
             task.status = ScanTaskStatus.FAILED
             task.error_message = "扫描任务发生内部错误"
             task.finished_at = datetime.now(timezone.utc)
+            task.worker_id = None
+            task.lease_expires_at = None
+            task.heartbeat_at = None
             batch_ids: set[int] = set()
             for item in task.items:
                 item.status = ScanTaskStatus.FAILED
@@ -459,6 +571,7 @@ class ScanQueueService:
         if self._executor is not None:
             return
         self._stop_event.clear()
+        self._heartbeat_stop_event.clear()
         self._executor = ThreadPoolExecutor(
             max_workers=self.max_workers,
             thread_name_prefix="device-scan",
@@ -468,6 +581,12 @@ class ScanQueueService:
             name="scan-dispatcher",
             daemon=True,
         )
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name="scan-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
         self._dispatcher_thread.start()
         self._wake_event.set()
 
@@ -481,7 +600,12 @@ class ScanQueueService:
         if dispatcher is not None:
             dispatcher.join()
         executor.shutdown(wait=True, cancel_futures=False)
+        self._heartbeat_stop_event.set()
+        heartbeat = self._heartbeat_thread
+        if heartbeat is not None:
+            heartbeat.join()
         self._dispatcher_thread = None
+        self._heartbeat_thread = None
         self._executor = None
 
     def cancel_device(self, device_id: int, *, session: Session | None = None) -> bool:

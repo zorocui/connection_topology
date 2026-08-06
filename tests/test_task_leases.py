@@ -15,7 +15,7 @@ from app.models import (
     ScanTaskStatus,
     ScanTrigger,
 )
-from app.services.task_leases import claim_scan_tasks
+from app.services.task_leases import claim_scan_tasks, renew_scan_leases
 
 
 def seed_devices(app, count: int) -> list[int]:
@@ -285,3 +285,79 @@ def test_claim_sets_initial_lease_and_refreshes_linked_batch(app):
         assert persisted_batch.status == ScanBatchStatus.RUNNING
         assert persisted_batch.pending_tasks == 0
         assert persisted_batch.running_tasks == 1
+
+
+def test_renew_scan_leases_updates_owned_tasks_and_returns_lost_ids(app):
+    device_ids = seed_devices(app, 2)
+    task_ids = seed_pending_tasks(app, device_ids)
+    claimed = app.state.transaction_runner.run(
+        "claim_for_renewal",
+        lambda session: claim_scan_tasks(session, "worker-alive", 2, 30, 90),
+    )
+    assert set(claimed) == set(task_ids)
+
+    with app.state.session_factory() as session:
+        original_heartbeat = session.get(ScanTask, task_ids[0]).heartbeat_at
+
+    lost = app.state.transaction_runner.run(
+        "renew_scan_leases",
+        lambda session: renew_scan_leases(
+            session,
+            "worker-alive",
+            [task_ids[0], task_ids[1], 999_999],
+            90,
+        ),
+    )
+
+    assert lost == {999_999}
+    with app.state.session_factory() as session:
+        tasks = [session.get(ScanTask, task_id) for task_id in task_ids]
+        assert all(task.worker_id == "worker-alive" for task in tasks)
+        assert all(task.heartbeat_at >= original_heartbeat for task in tasks)
+        assert all(task.lease_expires_at > task.heartbeat_at for task in tasks)
+
+
+def test_renew_scan_leases_does_not_revive_expired_or_reassigned_task(app):
+    first_device_id, second_device_id = seed_devices(app, 2)
+    now = datetime.now(timezone.utc)
+    with app.state.session_factory() as session:
+        expired = ScanTask(
+            device_id=first_device_id,
+            trigger_type=ScanTrigger.BATCH,
+            priority=80,
+            status=ScanTaskStatus.RUNNING,
+            worker_id="worker-old",
+            lease_expires_at=now - timedelta(seconds=1),
+            heartbeat_at=now - timedelta(seconds=10),
+            attempt_count=1,
+        )
+        reassigned = ScanTask(
+            device_id=second_device_id,
+            trigger_type=ScanTrigger.BATCH,
+            priority=80,
+            status=ScanTaskStatus.RUNNING,
+            worker_id="worker-new",
+            lease_expires_at=now + timedelta(seconds=90),
+            heartbeat_at=now,
+            attempt_count=2,
+        )
+        session.add_all([expired, reassigned])
+        session.commit()
+        task_ids = [expired.id, reassigned.id]
+
+    lost = app.state.transaction_runner.run(
+        "renew_lost_scan_leases",
+        lambda session: renew_scan_leases(
+            session,
+            "worker-old",
+            task_ids,
+            90,
+        ),
+    )
+
+    assert lost == set(task_ids)
+    with app.state.session_factory() as session:
+        expired = session.get(ScanTask, task_ids[0])
+        reassigned = session.get(ScanTask, task_ids[1])
+        assert expired.lease_expires_at < datetime.now(timezone.utc)
+        assert reassigned.worker_id == "worker-new"
