@@ -1,4 +1,5 @@
 import logging
+import threading
 from collections import defaultdict
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,10 @@ from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from app.models import Device, ScanRun, ScanTrigger, SystemSetting
 from app.services.database_transactions import PostgresTransactionRunner
+from app.services.postgres_leader import (
+    SCHEDULER_LEADER_LOCK_KEY,
+    PostgresLeaderElector,
+)
 from app.services.retention import resolve_device_retention
 from app.services.scan_queue import (
     PRIORITY_SCHEDULED,
@@ -67,6 +72,16 @@ class SchedulerService:
         )
         self.on_history_purged = on_history_purged
         self.scheduler = BackgroundScheduler(timezone="UTC")
+        engine = session_factory.kw.get("bind")
+        if engine is None:
+            raise ValueError("scheduler session factory must be bound to an engine")
+        self.elector = PostgresLeaderElector(
+            engine,
+            SCHEDULER_LEADER_LOCK_KEY,
+            self._become_leader,
+            self._lose_leadership,
+        )
+        self._leadership_lock = threading.RLock()
 
     def _enqueue_device(self, device_id: int) -> None:
         try:
@@ -117,8 +132,12 @@ class SchedulerService:
             self.scheduler.remove_job(job_id)
 
     def start(self) -> None:
-        if self.scheduler.running:
-            return
+        self.elector.start()
+
+    def _become_leader(self) -> None:
+        with self._leadership_lock:
+            if self.scheduler.running:
+                return
         self.scheduler.add_job(
             self._purge_history,
             "interval",
@@ -139,6 +158,11 @@ class SchedulerService:
             for device in devices:
                 self.sync_device(device)
 
+    def _lose_leadership(self) -> None:
+        with self._leadership_lock:
+            if self.scheduler.running:
+                self.scheduler.shutdown(wait=False)
+                self.scheduler = BackgroundScheduler(timezone="UTC")
+
     def shutdown(self) -> None:
-        if self.scheduler.running:
-            self.scheduler.shutdown(wait=False)
+        self.elector.shutdown()
