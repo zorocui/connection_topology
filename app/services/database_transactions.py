@@ -16,6 +16,9 @@ T = TypeVar("T")
 RETRYABLE_SQLSTATES = frozenset({"40P01", "40001"})
 DATABASE_UNAVAILABLE_MESSAGE = "数据库暂时不可用，请稍后重试"
 TRANSACTION_CONFLICT_MESSAGE = "数据库事务冲突，请重试"
+NESTED_TRANSACTION_MESSAGE = (
+    "Cannot start an independent database session inside transaction guard"
+)
 
 
 def postgres_sqlstate(exc: Exception) -> str | None:
@@ -32,6 +35,12 @@ class DatabaseUnavailable(RuntimeError):
 class TransactionConflict(RuntimeError):
     def __init__(self, operation_name: str) -> None:
         super().__init__(TRANSACTION_CONFLICT_MESSAGE)
+        self.operation_name = operation_name
+
+
+class NestedTransactionError(RuntimeError):
+    def __init__(self, operation_name: str) -> None:
+        super().__init__(NESTED_TRANSACTION_MESSAGE)
         self.operation_name = operation_name
 
 
@@ -99,6 +108,8 @@ class PostgresTransactionRunner:
         operation_name: str,
         operation: Callable[[Session], T],
     ) -> T:
+        if getattr(self._admission_state, "depth", 0):
+            raise NestedTransactionError(operation_name)
         for attempt in range(len(self.retry_delays) + 1):
             session: Session | None = None
             try:

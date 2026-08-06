@@ -181,19 +181,20 @@ def test_guard_releases_transaction_slot_after_exception(app):
     assert thread.is_alive() is False
 
 
-def test_guard_can_call_run_reentrantly_without_consuming_another_slot(app):
+def test_guard_rejects_run_that_would_checkout_a_second_connection(app):
     runner = PostgresTransactionRunner(
         app.state.session_factory,
         max_concurrent_transactions=1,
     )
 
-    with runner.guard("request_owned"):
-        result = runner.run(
+    with runner.guard("request_owned"), pytest.raises(
+        RuntimeError,
+        match="independent database session",
+    ):
+        runner.run(
             "nested_write",
             lambda session: session.scalar(text("SELECT 1")),
         )
-
-    assert result == 1
 
 
 @pytest.mark.parametrize(

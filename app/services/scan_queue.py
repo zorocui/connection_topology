@@ -546,7 +546,7 @@ class ScanQueueService:
         self._dispatcher_thread = None
         self._executor = None
 
-    def cancel_device(self, device_id: int) -> bool:
+    def cancel_device(self, device_id: int, *, session: Session | None = None) -> bool:
         def cancel(session: Session) -> bool:
             task = self._active_task(session, device_id)
             if task is None:
@@ -565,4 +565,6 @@ class ScanQueueService:
             return True
 
         with self._enqueue_lock:
+            if session is not None:
+                return cancel(session)
             return self.transaction_runner.run("cancel_scan_device", cancel)

@@ -530,7 +530,7 @@ def delete_device(device_id: int, request: Request, db: Session = Depends(get_db
         raise HTTPException(status_code=404, detail="设备不存在")
     if request.app.state.scheduler:
         request.app.state.scheduler.remove_device(device_id)
-    if not request.app.state.scan_queue.cancel_device(device_id):
+    if not request.app.state.scan_queue.cancel_device(device_id, session=db):
         raise HTTPException(status_code=409, detail="该设备正在扫描，请稍后再删除")
     db.delete(device)
     db.commit()

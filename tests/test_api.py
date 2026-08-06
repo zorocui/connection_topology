@@ -55,6 +55,26 @@ def test_mutating_route_maps_safe_database_errors_to_503(
     assert response.json() == {"detail": str(error_type("api_create_cluster"))}
 
 
+def test_delete_device_reuses_request_session_without_nested_runner(
+    client,
+    app,
+    linux_device_payload,
+    monkeypatch,
+):
+    device = client.post("/api/devices", json=linux_device_payload).json()
+
+    def reject_nested_run(operation_name, operation):
+        raise AssertionError(f"unexpected nested run: {operation_name}")
+
+    monkeypatch.setattr(app.state.transaction_runner, "run", reject_nested_run)
+
+    response = client.delete(f"/api/devices/{device['id']}")
+
+    assert response.status_code == 204
+    with app.state.session_factory() as session:
+        assert session.get(Device, device["id"]) is None
+
+
 def seed_marker_device(app, *, host):
     with app.state.session_factory() as session:
         marker = Device(

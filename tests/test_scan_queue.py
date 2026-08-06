@@ -323,3 +323,27 @@ def test_worker_pool_reaches_configured_network_concurrency(app):
         assert collector.maximum == 30
     finally:
         queue.shutdown()
+
+
+def test_concurrent_request_owned_device_deletes_use_one_connection_each(app):
+    device_ids = seed_devices(app, 10)
+    queue = app.state.scan_queue
+
+    def delete_device_in_request(device_id):
+        with (
+            app.state.transaction_runner.guard("api_delete_device"),
+            app.state.session_factory() as session,
+        ):
+            device = session.get(Device, device_id)
+            assert device is not None
+            assert queue.cancel_device(device_id, session=session) is True
+            session.delete(device)
+            session.commit()
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(delete_device_in_request, device_id) for device_id in device_ids]
+        for future in futures:
+            future.result()
+
+    with app.state.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(Device)) == 0
