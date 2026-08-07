@@ -9,7 +9,7 @@ if not exist "%POWERSHELL_SCRIPT%" (
     goto :finish
 )
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%POWERSHELL_SCRIPT%"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%POWERSHELL_SCRIPT%" %*
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if "%EXIT_CODE%"=="0" (

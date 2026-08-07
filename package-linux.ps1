@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+    [switch]$NoWheelhouse
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -11,10 +13,13 @@ $archiveName = "connection-topology-linux-$timestamp.tar.gz"
 $archivePath = Join-Path $projectRoot $archiveName
 $requiredPaths = @(
     "app",
+    "migrations",
     "pyproject.toml",
-    ".env",
+    "alembic.ini",
+    "start.sh",
     ".env.example",
-    "README.md"
+    "README.md",
+    "docs/postgresql-15-deployment.md"
 )
 $optionalPath = "wheelhouse"
 
@@ -38,7 +43,7 @@ foreach ($path in $requiredPaths) {
     $packagePaths.Add($path)
 }
 
-$includesWheelhouse = Test-Path -LiteralPath (Join-Path $projectRoot $optionalPath)
+$includesWheelhouse = (-not $NoWheelhouse) -and (Test-Path -LiteralPath (Join-Path $projectRoot $optionalPath))
 if ($includesWheelhouse) {
     $packagePaths.Add($optionalPath)
 } else {
@@ -101,7 +106,7 @@ try {
     Write-Host "Package created: $($archive.FullName)"
     Write-Host "File size: $sizeMiB MiB"
     Write-Host "Includes wheelhouse: $includesWheelhouse"
-    Write-Warning "The archive contains .env. Transfer and store it securely."
+    Write-Host "Note: .env is not packaged. Create it on the target host from .env.example."
 } catch {
     if (Test-Path -LiteralPath $archivePath) {
         Remove-Item -LiteralPath $archivePath -Force
