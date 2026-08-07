@@ -182,7 +182,12 @@ class LinuxCollector:
                     output_chunks.append(channel.recv(65536))
                 while channel.recv_stderr_ready():
                     error_chunks.append(channel.recv_stderr(65536))
-                if channel.exit_status_ready():
+                # exit-status may arrive before the tail of stdout (e.g. when
+                # the remote process exits with undrained pipe data), so only
+                # stop once EOF/close guarantees all data has been buffered.
+                if channel.closed or (
+                    channel.exit_status_ready() and channel.eof_received
+                ):
                     while channel.recv_ready():
                         output_chunks.append(channel.recv(65536))
                     while channel.recv_stderr_ready():

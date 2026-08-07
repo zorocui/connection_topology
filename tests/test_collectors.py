@@ -42,6 +42,10 @@ class FakeChannel:
             and not self.stderr_chunks
         )
 
+    @property
+    def eof_received(self):
+        return self.exit_status_ready()
+
     def recv_exit_status(self):
         assert not self.never_exit
         assert not self.stdout_chunks
@@ -198,6 +202,92 @@ def test_linux_execute_closes_channel_on_total_timeout(monkeypatch):
     assert captured.value.code == "command_timeout"
     assert str(captured.value) == "远程 ss 命令执行超时"
     assert channel.closed is True
+
+
+def _ss_like_payload(lines):
+    rows = []
+    for index in range(lines):
+        local = f"::ffff:10.160.{index % 250 + 1}.{(index * 7) % 250 + 1}:{20000 + index}"
+        remote = f"::ffff:10.161.{index % 250 + 1}.{(index * 13) % 250 + 1}:{1 + index}"
+        rows.append(
+            f"tcp   ESTAB     0      0          {local:<38} {remote:<38} "
+            f'users:(("java",pid={1000 + index % 5000},fd={index % 100}))'
+        )
+    return ("\n".join(rows) + "\n").encode()
+
+
+def test_linux_execute_collects_output_arriving_after_exit_status():
+    import socket
+    import threading
+    import time
+
+    import paramiko
+
+    payload = _ss_like_payload(4000)
+    host_key = paramiko.RSAKey.generate(2048)
+
+    class EarlyExitServer(paramiko.ServerInterface):
+        def check_channel_request(self, kind, chanid):
+            if kind == "session":
+                return paramiko.OPEN_SUCCEEDED
+            return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+
+        def check_auth_password(self, username, password):
+            return paramiko.AUTH_SUCCESSFUL
+
+        def get_allowed_auths(self, username):
+            return "password"
+
+        def check_channel_exec_request(self, channel, command):
+            threading.Thread(target=self._stream, args=(channel,), daemon=True).start()
+            return True
+
+        def _stream(self, channel):
+            cut = int(len(payload) * 0.6)
+            sent = 0
+            while sent < cut:
+                sent += channel.send(payload[sent:cut])
+            # Like OpenSSH reaping a process whose pipe still holds data:
+            # exit-status first, remaining stdout afterwards.
+            channel.send_exit_status(0)
+            time.sleep(0.05)
+            while sent < len(payload):
+                sent += channel.send(payload[sent:])
+            channel.close()
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def accept():
+        sock, _ = listener.accept()
+        transport = paramiko.Transport(sock)
+        transport.add_server_key(host_key)
+        transport.start_server(server=EarlyExitServer())
+
+    threading.Thread(target=accept, daemon=True).start()
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            "127.0.0.1",
+            port=port,
+            username="ops",
+            password="secret",
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        collector = LinuxCollector(timeout=30)
+        code, output, _ = collector._execute(client, "ss -H -tunap")
+    finally:
+        client.close()
+        listener.close()
+
+    assert code == 0
+    assert output.encode() == payload
+    assert len(parse_ss_output(output)) == 4000
 
 
 def test_linux_collect_logs_raw_skipped_line_and_returns_warning(monkeypatch, caplog):
