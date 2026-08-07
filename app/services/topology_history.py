@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Collection, Iterable, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -280,17 +279,20 @@ def aggregate_historical_connections(
         ),
         ConnectionRecord.remote_ip.is_not(None),
     ]
-    candidate_ids = _candidate_connection_ids(
-        conditions,
-        source_device_ids=source_device_ids,
-        inbound_addresses=inbound_addresses,
-    )
+    if source_device_ids is not None or inbound_addresses is not None:
+        conditions.append(
+            or_(
+                ScanRun.device_id.in_(sorted(set(source_device_ids or ()))),
+                ConnectionRecord.remote_ip.in_(
+                    sorted(set(inbound_addresses or ()))
+                ),
+            )
+        )
 
     eligible = (
         select(
             ConnectionRecord.id.label("connection_id"),
             ConnectionRecord.protocol.label("protocol"),
-            ConnectionRecord.address_family.label("stored_address_family"),
             ConnectionRecord.local_ip.label("local_ip"),
             ConnectionRecord.local_port.label("local_port"),
             ConnectionRecord.remote_ip.label("remote_ip"),
@@ -305,7 +307,7 @@ def aggregate_historical_connections(
             process_key,
         )
         .join(ScanRun, ScanRun.id == ConnectionRecord.scan_run_id)
-        .where(ConnectionRecord.id.in_(candidate_ids))
+        .where(*conditions)
         .subquery()
     )
     raw_key = (
@@ -317,43 +319,21 @@ def aggregate_historical_connections(
     )
     payload_separator = "\x1f"
     latest_marker = (
-        func.to_char(eligible.c.started_at, "YYYYMMDDHH24MISSUS")
+        func.lpad(
+            cast(
+                func.floor(
+                    func.extract("epoch", eligible.c.started_at) * 1000000
+                ),
+                String,
+            ),
+            20,
+            "0",
+        )
         + literal("|")
         + func.lpad(cast(eligible.c.scan_id, String), 20, "0")
         + literal("|")
         + func.lpad(cast(eligible.c.connection_id, String), 20, "0")
     )
-    latest_payload = func.max(
-        latest_marker
-        + literal(payload_separator)
-        + cast(
-            func.json_build_object(
-                "connection_id",
-                eligible.c.connection_id,
-                "protocol",
-                eligible.c.protocol,
-                "local_ip",
-                eligible.c.local_ip,
-                "local_port",
-                eligible.c.local_port,
-                "remote_port",
-                eligible.c.remote_port,
-                "state",
-                eligible.c.state,
-                "pid",
-                eligible.c.pid,
-                "process_name",
-                eligible.c.process_name,
-                "device_id",
-                eligible.c.device_id,
-                "scan_id",
-                eligible.c.scan_id,
-                "started_at_epoch",
-                func.extract("epoch", eligible.c.started_at),
-            ),
-            String,
-        )
-    ).label("latest_payload")
     hostname_payload = func.max(
         case(
             (
@@ -370,6 +350,7 @@ def aggregate_historical_connections(
             *raw_key,
             func.min(eligible.c.started_at).label("first_seen"),
             func.max(eligible.c.started_at).label("last_seen"),
+            func.max(latest_marker).label("latest_marker"),
             func.string_agg(
                 func.distinct(cast(eligible.c.scan_id, String)), literal(",")
             ).label(
@@ -388,21 +369,39 @@ def aggregate_historical_connections(
             func.string_agg(
                 func.distinct(cast(eligible.c.pid, String)), literal(",")
             ).label("pids"),
-            latest_payload,
             hostname_payload,
         ).group_by(*raw_key)
     ).all()
     if not aggregate_rows:
         return []
 
+    latest_rows = session.execute(
+        select(
+            ConnectionRecord.id.label("connection_id"),
+            ConnectionRecord.protocol.label("protocol"),
+            ConnectionRecord.local_ip.label("local_ip"),
+            ConnectionRecord.local_port.label("local_port"),
+            ConnectionRecord.remote_port.label("remote_port"),
+            ConnectionRecord.state.label("state"),
+            ConnectionRecord.pid.label("pid"),
+            ConnectionRecord.process_name.label("process_name"),
+            ScanRun.id.label("scan_id"),
+            ScanRun.device_id.label("device_id"),
+            ScanRun.started_at.label("started_at"),
+        )
+        .join(ScanRun, ScanRun.id == ConnectionRecord.scan_run_id)
+        .where(
+            ConnectionRecord.id.in_(
+                int(row.latest_marker.rsplit("|", 1)[1])
+                for row in aggregate_rows
+            )
+        )
+    ).all()
+    latest_by_id = {row.connection_id: row for row in latest_rows}
+
     groups: dict[tuple, dict] = {}
     for row in aggregate_rows:
-        _, encoded_latest = row.latest_payload.split(payload_separator, 1)
-        latest = json.loads(encoded_latest)
-        latest["started_at"] = datetime.fromtimestamp(
-            float(latest.pop("started_at_epoch")),
-            timezone.utc,
-        ).astimezone(row.first_seen.tzinfo)
+        latest = latest_by_id[int(row.latest_marker.rsplit("|", 1)[1])]
         hostname = (
             row.hostname_payload.split(payload_separator, 1)[1]
             if row.hostname_payload
@@ -426,32 +425,32 @@ def aggregate_historical_connections(
         }
         local_ports = _csv_int_set(row.local_ports)
         pids = _csv_int_set(row.pids)
-        latest_local_ip = normalize_ip_address(latest["local_ip"])
+        latest_local_ip = normalize_ip_address(latest.local_ip)
         assert latest_local_ip is not None
         latest_marker = (
-            latest["started_at"],
-            latest["scan_id"],
-            latest["connection_id"],
+            latest.started_at,
+            latest.scan_id,
+            latest.connection_id,
         )
         bucket = groups.get(normalized_key)
         if bucket is None:
             bucket = {
-                "id": latest["connection_id"],
-                "protocol": latest["protocol"],
+                "id": latest.connection_id,
+                "protocol": latest.protocol,
                 "address_family": (
                     "ipv6" if ":" in latest_local_ip else "ipv4"
                 ),
                 "local_ip": latest_local_ip,
-                "local_port": latest["local_port"],
+                "local_port": latest.local_port,
                 "remote_ip": normalized_remote,
-                "remote_port": latest["remote_port"],
-                "state": latest["state"],
-                "pid": latest["pid"],
-                "process_name": latest["process_name"],
+                "remote_port": latest.remote_port,
+                "state": latest.state,
+                "pid": latest.pid,
+                "process_name": latest.process_name,
                 "remote_hostname": hostname,
-                "source_device_id": latest["device_id"],
-                "scan_id": latest["scan_id"],
-                "scan_time": latest["started_at"].isoformat(),
+                "source_device_id": latest.device_id,
+                "scan_id": latest.scan_id,
+                "scan_time": latest.started_at.isoformat(),
                 "first_seen": row.first_seen.isoformat(),
                 "last_seen": row.last_seen.isoformat(),
                 "_first_seen": row.first_seen,
@@ -481,20 +480,20 @@ def aggregate_historical_connections(
             previous_hostname = bucket.get("remote_hostname")
             bucket.update(
                 {
-                    "id": latest["connection_id"],
-                    "protocol": latest["protocol"],
+                    "id": latest.connection_id,
+                    "protocol": latest.protocol,
                     "address_family": (
                         "ipv6" if ":" in latest_local_ip else "ipv4"
                     ),
                     "local_ip": latest_local_ip,
-                    "local_port": latest["local_port"],
-                    "remote_port": latest["remote_port"],
-                    "state": latest["state"],
-                    "pid": latest["pid"],
-                    "process_name": latest["process_name"],
+                    "local_port": latest.local_port,
+                    "remote_port": latest.remote_port,
+                    "state": latest.state,
+                    "pid": latest.pid,
+                    "process_name": latest.process_name,
                     "remote_hostname": hostname or previous_hostname,
-                    "scan_id": latest["scan_id"],
-                    "scan_time": latest["started_at"].isoformat(),
+                    "scan_id": latest.scan_id,
+                    "scan_time": latest.started_at.isoformat(),
                     "_latest_marker": latest_marker,
                 }
             )
