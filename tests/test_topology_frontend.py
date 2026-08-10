@@ -139,6 +139,18 @@ def test_cluster_mode_filters_server_side_and_loads_details_on_demand():
     assert "window.setTimeout(load, 350)" in script
 
 
+def test_edge_connections_load_in_pages():
+    script = script_text()
+
+    assert "const EDGE_CONNECTION_PAGE_SIZE = 500" in script
+    assert 'params.set("limit", EDGE_CONNECTION_PAGE_SIZE)' in script
+    assert 'params.set("offset", offset)' in script
+    assert "renderPaginatedEdgeDrawer" in script
+    assert "加载更多" in script
+    assert "page.total" in script
+    assert "result.total > result.connections.length" in script
+
+
 def test_topology_details_show_history_metadata_in_chinese():
     script = script_text()
 

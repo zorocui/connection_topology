@@ -799,6 +799,8 @@ def get_edge_connections(
     protocol: str | None = Query(default=None),
     state: str | None = Query(default=None),
     process: str | None = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ):
     def build() -> dict:
@@ -812,20 +814,32 @@ def get_edge_connections(
             state=state,
             process=process,
         )
-        return {"source": source, "target": target, "connections": rows}
+        return {
+            "source": source,
+            "target": target,
+            "total": len(rows),
+            "connections": rows,
+        }
 
     if window == "current":
-        return build()
-    cache_key = (
-        "edge-connections",
-        source,
-        target,
-        window,
-        protocol or "",
-        state or "",
-        process or "",
-    )
-    return request.app.state.topology_cache.get_or_compute(cache_key, build)
+        result = build()
+    else:
+        cache_key = (
+            "edge-connections",
+            source,
+            target,
+            window,
+            protocol or "",
+            state or "",
+            process or "",
+        )
+        result = request.app.state.topology_cache.get_or_compute(cache_key, build)
+    return {
+        "source": result["source"],
+        "target": result["target"],
+        "total": result["total"],
+        "connections": result["connections"][offset : offset + limit],
+    }
 
 
 @router.get("/scans/{scan_id}/diff")

@@ -600,6 +600,18 @@ def _node_target_addresses(
     return addresses
 
 
+def _connection_group_sort_key(row: dict) -> tuple:
+    """Stable ordering so paginated edge-connections responses don't drift."""
+    return (
+        str(row.get("remote_ip") or ""),
+        row.get("remote_port") or 0,
+        str(row.get("protocol") or ""),
+        str(row.get("process_name") or ""),
+        row.get("source_device_id") or 0,
+        row.get("id") or 0,
+    )
+
+
 def build_edge_connections(
     session: Session,
     resolver: HostAddressResolver,
@@ -652,4 +664,5 @@ def build_edge_connections(
         process=process,
     )
     edge_groups = group_cluster_edges(services, context)
-    return edge_groups.get((source_id, target_id), [])
+    rows = edge_groups.get((source_id, target_id), [])
+    return sorted(rows, key=_connection_group_sort_key)

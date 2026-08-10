@@ -762,3 +762,105 @@ def test_edge_connections_api_serves_slim_graph_and_details(app, client):
     )
     assert filtered_response.status_code == 200
     assert filtered_response.json()["connections"] == []
+
+
+def test_edge_connections_api_paginates_large_edges(app, client):
+    with app.state.session_factory() as session:
+        production = Cluster(name="paged-production")
+        database = Cluster(name="paged-database")
+        session.add_all([production, database])
+        session.flush()
+        web = add_device(session, app, "paged-web", "10.10.0.1", production)
+        add_device(session, app, "paged-db", "10.10.1.1", database)
+        scan_time = datetime.now(timezone.utc)
+        scan = ScanRun(
+            device_id=web.id,
+            trigger_type=ScanTrigger.MANUAL,
+            status=ScanStatus.SUCCESS,
+            started_at=scan_time,
+            finished_at=scan_time,
+            connection_count=7,
+        )
+        session.add(scan)
+        session.flush()
+        for index in range(7):
+            session.add(
+                ConnectionRecord(
+                    scan_run_id=scan.id,
+                    protocol="tcp",
+                    address_family="ipv4",
+                    local_ip=web.host,
+                    local_port=40000 + index,
+                    remote_ip="10.10.1.1",
+                    remote_port=7000 + index,
+                    state="ESTABLISHED",
+                    pid=100 + index,
+                    process_name="client",
+                )
+            )
+        session.flush()
+        sync_service_observations(session, scan)
+        session.commit()
+        production_id = production.id
+        database_id = database.id
+
+    source = f"cluster-{production_id}"
+    target = f"cluster-{database_id}"
+
+    def fetch_page(**extra):
+        response = client.get(
+            "/api/topology/edge-connections",
+            params={
+                "window": "current",
+                "source": source,
+                "target": target,
+                **extra,
+            },
+        )
+        assert response.status_code == 200
+        return response.json()
+
+    first_page = fetch_page(limit=3)
+    assert first_page["total"] == 7
+    assert [row["remote_port"] for row in first_page["connections"]] == [
+        7000,
+        7001,
+        7002,
+    ]
+
+    second_page = fetch_page(limit=3, offset=3)
+    assert second_page["total"] == 7
+    assert [row["remote_port"] for row in second_page["connections"]] == [
+        7003,
+        7004,
+        7005,
+    ]
+
+    last_page = fetch_page(limit=3, offset=6)
+    assert [row["remote_port"] for row in last_page["connections"]] == [7006]
+
+    # 页序必须确定，重复请求同一页结果一致
+    assert fetch_page(limit=3)["connections"] == first_page["connections"]
+
+    # 全量页并集恰好覆盖所有连接组
+    merged = (
+        first_page["connections"]
+        + second_page["connections"]
+        + last_page["connections"]
+    )
+    assert len({row["id"] for row in merged}) == 7
+
+    default_page = fetch_page()
+    assert default_page["total"] == 7
+    assert len(default_page["connections"]) == 7
+
+    too_large = client.get(
+        "/api/topology/edge-connections",
+        params={
+            "window": "current",
+            "source": source,
+            "target": target,
+            "limit": 5000,
+        },
+    )
+    assert too_large.status_code == 422

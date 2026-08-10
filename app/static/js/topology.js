@@ -146,10 +146,10 @@
       </div>`;
   };
 
-  const renderDrawer = (title, subtitle, rows) => {
+  const renderDrawer = (title, subtitle, rows, note = "") => {
     drawer.innerHTML = `<p class="eyebrow">连接详情</p>
       <h2>${escapeHtml(title)}</h2><p class="drawer-subtitle">${escapeHtml(subtitle || "")}</p>
-      ${connectionTable(rows)}`;
+      ${note}${connectionTable(rows)}`;
   };
 
   const renderClusterOverview = elements => {
@@ -170,13 +170,17 @@
       <p class="muted">点击拓扑中的节点或连线查看详细信息。</p>`;
   };
 
-  const fetchEdgeConnections = async (sourceId, targetId) => {
+  const EDGE_CONNECTION_PAGE_SIZE = 500;
+
+  const fetchEdgeConnections = async (sourceId, targetId, offset = 0) => {
     const params = topologyFilterParams();
     params.set("window", windowSelect.value);
     params.set("source", sourceId);
     params.set("target", targetId);
+    params.set("limit", EDGE_CONNECTION_PAGE_SIZE);
+    params.set("offset", offset);
     const response = await fetch(`/api/topology/edge-connections?${params}`);
-    if (!response.ok) return {connections: []};
+    if (!response.ok) return {total: 0, connections: []};
     return response.json();
   };
 
@@ -186,12 +190,43 @@
       <p class="muted">正在加载连接…</p>`;
   };
 
+  const renderPaginatedEdgeDrawer = (peer, sourceId, targetId, total, loaded, seq) => {
+    const remaining = Math.max(0, total - loaded.length);
+    drawer.innerHTML = `<p class="eyebrow">连接详情</p>
+      <h2>${escapeHtml(peer.label)}</h2><p class="drawer-subtitle">${escapeHtml(peer.subtitle || "")}</p>
+      ${total > EDGE_CONNECTION_PAGE_SIZE
+        ? `<p class="muted">共 ${total} 条连接，已显示 ${loaded.length} 条</p>`
+        : ""}
+      ${connectionTable(loaded)}
+      ${remaining > 0
+        ? `<button id="load-more-connections" class="button drawer-load-more" type="button">
+            加载更多（剩余 ${remaining} 条）</button>`
+        : ""}`;
+    const button = document.getElementById("load-more-connections");
+    if (!button) return;
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      button.textContent = "正在加载…";
+      const page = await fetchEdgeConnections(sourceId, targetId, loaded.length);
+      if (seq !== drawerRequestSeq) return;
+      loaded.push(...page.connections);
+      renderPaginatedEdgeDrawer(peer, sourceId, targetId, page.total, loaded, seq);
+    });
+  };
+
   const loadEdgeConnections = async (peer, sourceId, targetId) => {
     const seq = ++drawerRequestSeq;
     showDrawerLoading(peer.label, peer.subtitle);
-    const result = await fetchEdgeConnections(sourceId, targetId);
+    const firstPage = await fetchEdgeConnections(sourceId, targetId);
     if (seq !== drawerRequestSeq) return;
-    renderDrawer(peer.label, peer.subtitle, result.connections);
+    renderPaginatedEdgeDrawer(
+      peer,
+      sourceId,
+      targetId,
+      firstPage.total,
+      [...firstPage.connections],
+      seq
+    );
   };
 
   const loadNodeConnections = async (nodeData, pairs) => {
@@ -201,10 +236,16 @@
       pairs.map(pair => fetchEdgeConnections(pair.source, pair.target))
     );
     if (seq !== drawerRequestSeq) return;
+    const truncated = results.some(
+      result => result.total > result.connections.length
+    );
     renderDrawer(
       nodeData.label,
       nodeData.subtitle,
-      results.flatMap(result => result.connections)
+      results.flatMap(result => result.connections),
+      truncated
+        ? `<p class="muted">连接数量较大，每条边仅显示前 ${EDGE_CONNECTION_PAGE_SIZE} 条；点击单条边可分页查看全部。</p>`
+        : ""
     );
   };
 

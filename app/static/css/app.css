@@ -142,6 +142,7 @@ input:focus, select:focus, button:focus-visible, a:focus-visible { outline: 2px 
 .canvas-legend i.edge { width: 14px; height: 2px; background: var(--line-bright); border: 0; vertical-align: middle; }
 .canvas-legend i.edge.disconnected { background: #667176; }
 .detail-drawer { border-left: 1px solid var(--line); padding: 24px 20px; overflow: auto; max-height: calc(100vh - 275px); }
+.drawer-load-more { width: 100%; margin-top: 12px; }
 .drawer-subtitle { margin: 8px 0 18px; color: var(--muted); font: 10px var(--mono); }
 .detail-count { margin: 25px 0; color: var(--signal); font: 34px/1 var(--mono); }
 .detail-count small { display: block; margin-top: 7px; color: var(--muted); font-size: 8px; letter-spacing: .15em; }
@@ -389,10 +390,6 @@ textarea:focus { outline: 2px solid var(--signal); outline-offset: 2px; }
   color: var(--signal); font: 9px var(--mono);
 }
 .button.danger:hover { border-color: var(--danger); color: var(--danger); }
-.member-list { display: grid; gap: 7px; margin: 18px 0; }
-.member-list article { padding: 10px 12px; border: 1px solid var(--line); background: #091316; }
-.member-list b, .member-list small { display: block; }
-.member-list small { color: var(--muted); margin-top: 5px; font: 9px var(--mono); }
 .import-links { display: flex; gap: 18px; align-items: center; }
 .link-button { border: 0; background: transparent; padding: 0; cursor: pointer; }
 .import-rows { margin-top: 14px; max-height: 340px; overflow: auto; }
