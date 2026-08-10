@@ -1,5 +1,7 @@
 [CmdletBinding()]
 param(
+    # Deprecated no-op: dependency wheels are never bundled into the archive.
+    # Kept so existing invocations like `package-linux.cmd -NoWheelhouse` still run.
     [switch]$NoWheelhouse
 )
 
@@ -21,7 +23,6 @@ $requiredPaths = @(
     "README.md",
     "docs/postgresql-15-deployment.md"
 )
-$optionalPath = "wheelhouse"
 
 Set-Location -LiteralPath $projectRoot
 
@@ -41,13 +42,6 @@ if ($missingPaths.Count -gt 0) {
 $packagePaths = [System.Collections.Generic.List[string]]::new()
 foreach ($path in $requiredPaths) {
     $packagePaths.Add($path)
-}
-
-$includesWheelhouse = (-not $NoWheelhouse) -and (Test-Path -LiteralPath (Join-Path $projectRoot $optionalPath))
-if ($includesWheelhouse) {
-    $packagePaths.Add($optionalPath)
-} else {
-    Write-Host "Note: wheelhouse was not found; offline dependencies will not be included."
 }
 
 if (Test-Path -LiteralPath $archivePath) {
@@ -105,7 +99,6 @@ try {
     $sizeMiB = [Math]::Round($archive.Length / 1MB, 2)
     Write-Host "Package created: $($archive.FullName)"
     Write-Host "File size: $sizeMiB MiB"
-    Write-Host "Includes wheelhouse: $includesWheelhouse"
     Write-Host "Note: .env is not packaged. Create it on the target host from .env.example."
 } catch {
     if (Test-Path -LiteralPath $archivePath) {
