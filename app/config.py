@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)
     history_retention_days: int = Field(default=7, ge=1, le=3650)
+    raw_retention_days: int = Field(default=2, ge=1, le=3650)
     remote_timeout_seconds: int = Field(default=15, ge=1, le=120)
     scheduler_enabled: bool = True
     import_test_max_workers: int = Field(default=20, ge=1, le=200)
@@ -24,6 +25,11 @@ class Settings(BaseSettings):
     db_pool_recycle_seconds: int = Field(default=1800, ge=60, le=86400)
     scan_lease_seconds: int = Field(default=90, ge=30, le=600)
     task_heartbeat_seconds: int = Field(default=15, ge=5, le=120)
+    log_level: str = "INFO"
+    log_dir: str = "logs"
+    log_max_bytes: int = Field(default=10 * 1024 * 1024, ge=1024 * 1024, le=1024 * 1024 * 1024)
+    log_backup_count: int = Field(default=5, ge=1, le=100)
+    log_to_console: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -32,6 +38,15 @@ class Settings(BaseSettings):
         extra="ignore",
         case_sensitive=False,
     )
+
+    @field_validator("log_level")
+    @classmethod
+    def normalize_log_level(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        allowed = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+        if normalized not in allowed:
+            raise ValueError("LOG_LEVEL 必须是 DEBUG/INFO/WARNING/ERROR/CRITICAL 之一")
+        return normalized
 
     @field_validator("database_url")
     @classmethod

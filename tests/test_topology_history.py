@@ -1,5 +1,8 @@
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import delete, select
+from sqlalchemy.orm import selectinload
+
 from app.models import (
     ConnectionRecord,
     Device,
@@ -8,12 +11,13 @@ from app.models import (
     ScanStatus,
     ScanTrigger,
 )
+from app.services.service_observations import sync_service_observations
 from app.services.topology_history import (
+    WINDOW_DELTAS,
     aggregate_current_connections,
     aggregate_historical_connections,
     aggregate_service_connections,
     load_current_scans,
-    load_topology_scans,
 )
 
 NOW = datetime(2026, 7, 29, 8, 0, tzinfo=timezone.utc)
@@ -99,36 +103,10 @@ def add_scan(
     return scan
 
 
-def test_load_topology_scans_uses_window_and_success_only(app):
-    with app.state.session_factory() as session:
-        device = add_device(session, app)
-        old = add_scan(session, device, started_at=NOW - timedelta(days=2))
-        recent = add_scan(session, device, started_at=NOW - timedelta(hours=12))
-        add_scan(
-            session,
-            device,
-            started_at=NOW - timedelta(hours=1),
-            status=ScanStatus.FAILED,
-        )
-        session.commit()
-
-        current, scans = load_topology_scans(session, [device.id], "1d", now=NOW)
-
-        assert current[device.id].id == recent.id
-        assert [scan.id for scan in scans] == [recent.id]
-        assert old.id not in {scan.id for scan in scans}
-
-
-def test_load_topology_scans_keeps_old_current_baseline(app):
-    with app.state.session_factory() as session:
-        device = add_device(session, app)
-        old_current = add_scan(session, device, started_at=NOW - timedelta(days=10))
-        session.commit()
-
-        current, scans = load_topology_scans(session, [device.id], "7d", now=NOW)
-
-        assert current[device.id].id == old_current.id
-        assert [scan.id for scan in scans] == [old_current.id]
+def sync_observations(session, *scans):
+    session.flush()
+    for scan in scans:
+        sync_service_observations(session, scan)
 
 
 def test_load_current_scans_can_skip_connections(app):
@@ -173,6 +151,7 @@ def test_current_sql_filters_to_outbound_and_inbound_candidates(app):
             started_at=NOW,
             remote_ip="198.51.100.9",
         )
+        sync_observations(session, selected_scan, inbound_scan, unrelated_scan)
         session.commit()
         latest = {
             selected.id: selected_scan,
@@ -205,10 +184,15 @@ def test_current_sql_matches_existing_python_aggregation(app):
             started_at=NOW,
             remote_ip="::ffff:203.0.113.8",
         )
+        sync_observations(session, current)
         session.commit()
+        current_id = current.id
+        device_id = device.id
+        session.expunge_all()
+        reloaded = session.get(ScanRun, current_id)
 
-        expected = aggregate_service_connections([current], {current.id})
-        actual = aggregate_current_connections(session, {device.id: current})
+        expected = aggregate_service_connections([reloaded], {current_id})
+        actual = aggregate_current_connections(session, {device_id: reloaded})
 
         assert service_projection(actual) == service_projection(expected)
 
@@ -298,6 +282,55 @@ def test_aggregate_service_connections_counts_each_scan_once(app):
         assert rows[0]["observed_local_ports"] == [50000, 50001]
 
 
+def test_sql_history_keeps_group_when_sample_record_purged(app):
+    with app.state.session_factory() as session:
+        device = add_device(session, app)
+        disappeared = add_scan(
+            session,
+            device,
+            started_at=NOW - timedelta(days=5),
+        )
+        sync_observations(session, disappeared)
+        sample_id = disappeared.connections[0].id
+        # Simulate raw-record retention removing the sample row while the
+        # observation stays inside the history window.
+        session.execute(
+            delete(ConnectionRecord).where(
+                ConnectionRecord.scan_run_id == disappeared.id
+            )
+        )
+        session.commit()
+
+        rows = aggregate_historical_connections(
+            session,
+            [device.id],
+            set(),
+            "7d",
+            now=NOW,
+        )
+
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["id"] == sample_id
+        assert row["protocol"] == "tcp"
+        assert row["remote_ip"] == "203.0.113.8"
+        assert row["remote_port"] == 443
+        assert row["process_name"] == "client"
+        assert row["state"] is None
+        assert row["local_ip"] == "10.0.0.10"
+        assert row["local_port"] == 50000
+        assert row["pid"] == 100
+        assert row["scan_id"] == disappeared.id
+        assert row["is_current"] is False
+        assert row["observation_count"] == 1
+        assert datetime.fromisoformat(row["first_seen"]) == (
+            NOW - timedelta(days=5)
+        )
+        assert datetime.fromisoformat(row["scan_time"]) == (
+            NOW - timedelta(days=5)
+        )
+
+
 def test_aggregate_service_connections_hides_loopback_and_listeners(app):
     with app.state.session_factory() as session:
         device = add_device(session, app)
@@ -328,7 +361,7 @@ def test_aggregate_service_connections_hides_loopback_and_listeners(app):
 def test_sql_history_matches_python_aggregation(app):
     with app.state.session_factory() as session:
         device = add_device(session, app)
-        add_scan(
+        historical = add_scan(
             session,
             device,
             started_at=NOW - timedelta(hours=8),
@@ -357,16 +390,21 @@ def test_sql_history_matches_python_aggregation(app):
                 process_name="client",
             )
         )
+        sync_observations(session, historical, current)
         session.commit()
         device_id = device.id
         current_id = current.id
         session.expunge_all()
-        _, reloaded_scans = load_topology_scans(
-            session,
-            [device_id],
-            "1d",
-            now=NOW,
-        )
+        reloaded_scans = session.scalars(
+            select(ScanRun)
+            .where(
+                ScanRun.device_id == device_id,
+                ScanRun.status == ScanStatus.SUCCESS,
+                ScanRun.started_at >= NOW - WINDOW_DELTAS["1d"],
+            )
+            .options(selectinload(ScanRun.connections))
+            .order_by(ScanRun.started_at, ScanRun.id)
+        ).all()
 
         expected = aggregate_service_connections(
             reloaded_scans,
@@ -416,6 +454,7 @@ def test_sql_history_keeps_latest_row_and_latest_non_null_hostname(app):
                 process_name="client",
             )
         )
+        sync_observations(session, older, latest)
         session.commit()
 
         rows = aggregate_historical_connections(
@@ -469,6 +508,7 @@ def test_sql_history_filters_candidates_and_ignores_loopback(app):
                 process_name="loop",
             )
         )
+        sync_observations(session, selected_scan, inbound_scan, unrelated_scan)
         session.commit()
 
         actual = aggregate_historical_connections(
@@ -499,6 +539,7 @@ def test_sql_history_union_deduplicates_connection_matching_both_paths(app):
             started_at=NOW,
             remote_ip=selected.host,
         )
+        sync_observations(session, current)
         session.commit()
 
         rows = aggregate_historical_connections(

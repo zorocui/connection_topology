@@ -25,9 +25,11 @@ from app.services.topology_history import (
     aggregate_historical_connections,
     load_current_scans,
 )
+from app.services.service_observations import backfill_service_observations
 
-DEVICE_COUNT = 10
-SCANS_PER_DEVICE = 48
+DEVICE_COUNT = 150
+SCANS_PER_DEVICE = 24
+ROWS_PER_SERVICE = 10
 INSERT_BATCH_SIZE = 20_000
 
 
@@ -89,7 +91,9 @@ def _seed_database(engine: Engine, rows: int) -> datetime:
             scan_index = row_number % scan_count
             scan_id = scan_index + 1
             device_id = scan_devices[scan_index]
-            service_id = (row_number // scan_count) % 2_000
+            service_id = (
+                row_number // (scan_count * ROWS_PER_SERVICE)
+            ) % 2_000
             batch.append(
                 {
                     "scan_run_id": scan_id,
@@ -130,6 +134,10 @@ def run_benchmark(
         raise ValueError("rows must be positive")
 
     reference = _seed_database(engine, rows)
+    sync_started_at = time.perf_counter()
+    with engine.begin() as connection:
+        backfill_service_observations(connection)
+    sync_seconds = time.perf_counter() - sync_started_at
     session_factory = create_session_factory(engine)
     with session_factory() as session:
             devices = list(range(1, DEVICE_COUNT + 1))
@@ -182,6 +190,7 @@ def run_benchmark(
 
     return {
             "raw_rows": rows,
+            "sync_seconds": round(sync_seconds, 3),
             "service_groups": service_groups,
             "elapsed_seconds": round(elapsed_seconds, 3),
             "peak_python_mib": round(peak_bytes / 1024 / 1024, 2),

@@ -76,7 +76,12 @@ from app.services.scan_queue import (
     ScanQueueFull,
 )
 from app.services.scans import ScanService
-from app.services.topology import build_cluster_topology, build_topology, diff_scans
+from app.services.topology import (
+    build_cluster_topology,
+    build_edge_connections,
+    build_topology,
+    diff_scans,
+)
 from app.services.topology_history import (
     TopologyWindow,
     aggregate_historical_connections,
@@ -726,27 +731,25 @@ def get_latest_topology(
     window: TopologyWindow = Query("current"),
     db: Session = Depends(get_db),
 ):
+    def build() -> dict:
+        current_scans = load_current_scans(db, [device_id])
+        scan = current_scans.get(device_id)
+        if scan is None:
+            raise HTTPException(status_code=404, detail="该设备还没有成功采集快照")
+        services = None
+        if window != "current":
+            services = aggregate_historical_connections(
+                db,
+                [device_id],
+                {scan.id},
+                window,
+            )
+        return build_topology(scan, window=window, services=services)
+
+    if window == "current":
+        return build()
     cache_key = ("device", device_id, window)
-    if window != "current":
-        cached = request.app.state.topology_cache.get(cache_key)
-        if cached is not None:
-            return cached
-    current_scans = load_current_scans(db, [device_id])
-    scan = current_scans.get(device_id)
-    if scan is None:
-        raise HTTPException(status_code=404, detail="该设备还没有成功采集快照")
-    services = None
-    if window != "current":
-        services = aggregate_historical_connections(
-            db,
-            [device_id],
-            {scan.id},
-            window,
-        )
-    result = build_topology(scan, window=window, services=services)
-    if window != "current":
-        request.app.state.topology_cache.put(cache_key, result)
-    return result
+    return request.app.state.topology_cache.get_or_compute(cache_key, build)
 
 
 @router.get("/topology/clusters")
@@ -754,24 +757,75 @@ def get_cluster_topology(
     request: Request,
     window: TopologyWindow = Query("current"),
     cluster_id: int | None = Query(default=None, ge=1),
+    protocol: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    process: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ):
     if cluster_id is not None and db.get(Cluster, cluster_id) is None:
         raise HTTPException(status_code=404, detail="集群不存在")
-    cache_key = ("cluster", cluster_id, window)
-    if window != "current":
-        cached = request.app.state.topology_cache.get(cache_key)
-        if cached is not None:
-            return cached
-    result = build_cluster_topology(
-        db,
-        request.app.state.address_resolver,
-        window=window,
-        target_cluster_id=cluster_id,
+
+    def build() -> dict:
+        return build_cluster_topology(
+            db,
+            request.app.state.address_resolver,
+            window=window,
+            target_cluster_id=cluster_id,
+            embed_connections=False,
+            protocol=protocol,
+            state=state,
+            process=process,
+        )
+
+    if window == "current":
+        return build()
+    cache_key = (
+        "cluster",
+        cluster_id,
+        window,
+        protocol or "",
+        state or "",
+        process or "",
     )
-    if window != "current":
-        request.app.state.topology_cache.put(cache_key, result)
-    return result
+    return request.app.state.topology_cache.get_or_compute(cache_key, build)
+
+
+@router.get("/topology/edge-connections")
+def get_edge_connections(
+    request: Request,
+    source: str = Query(min_length=1),
+    target: str = Query(min_length=1),
+    window: TopologyWindow = Query("current"),
+    protocol: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    process: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    def build() -> dict:
+        rows = build_edge_connections(
+            db,
+            request.app.state.address_resolver,
+            source_id=source,
+            target_id=target,
+            window=window,
+            protocol=protocol,
+            state=state,
+            process=process,
+        )
+        return {"source": source, "target": target, "connections": rows}
+
+    if window == "current":
+        return build()
+    cache_key = (
+        "edge-connections",
+        source,
+        target,
+        window,
+        protocol or "",
+        state or "",
+        process or "",
+    )
+    return request.app.state.topology_cache.get_or_compute(cache_key, build)
 
 
 @router.get("/scans/{scan_id}/diff")

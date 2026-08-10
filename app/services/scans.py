@@ -14,6 +14,10 @@ from app.collectors import CollectorError, LinuxCollector, WindowsCollector
 from app.collectors.base import Collector, DeviceConnectionSpec, NormalizedConnection
 from app.models import ConnectionRecord, Device, OSType, ScanRun, ScanStatus, ScanTrigger
 from app.security import CredentialCipher, safe_error_message
+from app.services.service_observations import (
+    keep_connection_record,
+    sync_service_observations,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,13 +61,16 @@ def add_scan_outcome(session: Session, outcome: ScanOutcome) -> ScanRun:
     device = session.get(Device, outcome.device_id)
     if device is None:
         raise DeviceNotFound(f"设备 {outcome.device_id} 不存在")
+    connections = tuple(
+        row for row in outcome.connections if keep_connection_record(row)
+    )
     run = ScanRun(
         device_id=device.id,
         trigger_type=outcome.trigger,
         status=outcome.status,
         started_at=outcome.started_at,
         finished_at=outcome.finished_at,
-        connection_count=len(outcome.connections),
+        connection_count=len(connections),
         warning_message=outcome.warning_message,
         error_code=outcome.error_code,
         error_message=outcome.error_message,
@@ -84,9 +91,11 @@ def add_scan_outcome(session: Session, outcome: ScanOutcome) -> ScanRun:
                 pid=row.pid,
                 process_name=row.process_name,
             )
-            for row in outcome.connections
+            for row in connections
         ]
     )
+    session.flush()
+    sync_service_observations(session, run)
     device.last_scan_status = outcome.status
     device.last_scan_at = outcome.finished_at
     return run

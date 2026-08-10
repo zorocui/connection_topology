@@ -14,7 +14,7 @@ def test_cluster_filter_requires_explicit_target_selection():
     assert "目标集群" in template
     assert '<option value="">选择一个集群</option>' in template
     assert "全部集群和设备" not in template
-    assert "topology.js') }}?v=20260731-history-sql-v2" in template
+    assert "topology.js') }}?v=20260807-slim-graph" in template
 
 
 def test_cluster_mode_waits_for_explicit_selection_before_loading():
@@ -57,7 +57,7 @@ def test_topology_cancels_stale_requests_and_times_out_history():
     assert "new AbortController()" in script
     assert "activeTopologyController?.abort()" in script
     assert "window.setTimeout" in script
-    assert "15000" in script
+    assert "90000" in script
     assert "历史拓扑计算超时，请稍后重试或缩短时间范围。" in script
 
 
@@ -122,6 +122,21 @@ def test_topology_recomputes_edge_status_after_filters():
     assert "is_current: currentCount > 0 ? 1 : 0" in script
     assert "edge[is_current = 0]" in script
     assert '"line-color": "#667176"' in script
+
+
+def test_cluster_mode_filters_server_side_and_loads_details_on_demand():
+    script = script_text()
+
+    assert 'params.set("protocol", protocolSelect.value)' in script
+    assert 'params.set("state", stateSelect.value)' in script
+    assert 'params.set("process", process)' in script
+    assert 'topologyFilterParams().forEach' in script
+    assert "/api/topology/edge-connections" in script
+    assert 'params.set("source", sourceId)' in script
+    assert 'params.set("target", targetId)' in script
+    assert "loadEdgeConnections(peer, data.source, data.target)" in script
+    assert "loadNodeConnections" in script
+    assert "window.setTimeout(load, 350)" in script
 
 
 def test_topology_details_show_history_metadata_in_chinese():

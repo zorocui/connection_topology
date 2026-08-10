@@ -93,6 +93,25 @@ WEB_WORKERS × (DB_POOL_SIZE + DB_MAX_OVERFLOW + 2)
 - 只有取得 PostgreSQL leader 锁的进程运行 APScheduler；失去连接后自动让位。
 - 拓扑变更通过 PostgreSQL `NOTIFY` 使所有进程清缓存，30 秒 TTL 作为兜底。
 
+## 日志
+
+日志同时输出到控制台和 `LOG_DIR`（默认 `logs/`）下的 `.log` 文件，按大小轮转：
+
+- `app.log`：应用与 Uvicorn 服务日志，含北京时间（毫秒）、级别、进程 pid、线程名、模块和源文件行号。
+- `access.log`：HTTP 访问日志（`uvicorn.access`）。
+
+```dotenv
+LOG_LEVEL=INFO
+LOG_DIR=logs
+LOG_MAX_BYTES=10485760
+LOG_BACKUP_COUNT=5
+LOG_TO_CONSOLE=true
+```
+
+单个日志文件达到 `LOG_MAX_BYTES` 后轮转，最多保留 `LOG_BACKUP_COUNT` 个历史文件。
+所有日志在输出前会经过密码脱敏过滤器；多 worker 模式下各进程写同一组日志文件，
+通过日志行中的 pid 区分来源进程。
+
 ## 批量导入
 
 - 支持 `.xlsx`，单次最多 1000 行、5 MB。

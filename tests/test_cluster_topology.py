@@ -12,7 +12,13 @@ from app.models import (
     ScanStatus,
     ScanTrigger,
 )
-from app.services.topology import build_cluster_topology, build_topology
+from app.services.topology import (
+    build_cluster_topology,
+    build_edge_connections,
+    build_topology,
+    filter_service_connections,
+)
+from app.services.service_observations import sync_service_observations
 
 
 class LiteralResolver:
@@ -77,6 +83,8 @@ def add_scan(
                 process_name=process_name,
             )
         )
+    session.flush()
+    sync_service_observations(session, scan)
     return scan
 
 
@@ -559,3 +567,198 @@ def test_internal_cidr_applies_to_all_cluster_windows(app, window):
         )
 
         assert not topology["edges"]
+
+
+def test_cluster_graph_can_omit_embedded_connections(app):
+    with app.state.session_factory() as session:
+        production = Cluster(name="slim-production")
+        database = Cluster(name="slim-database")
+        session.add_all([production, database])
+        session.flush()
+        web = add_device(session, app, "slim-web", "10.0.0.1", production)
+        add_device(session, app, "slim-db", "10.0.1.1", database)
+        add_scan(session, web, ["10.0.1.1", "203.0.113.8"])
+        session.commit()
+
+        full = build_cluster_topology(session, LiteralResolver())
+        slim = build_cluster_topology(
+            session,
+            LiteralResolver(),
+            embed_connections=False,
+        )
+
+        assert full["edges"] and slim["edges"]
+        assert len(full["edges"]) == len(slim["edges"])
+        for full_edge, slim_edge in zip(full["edges"], slim["edges"]):
+            assert "connections" not in slim_edge["data"]
+            for key in (
+                "id",
+                "source",
+                "target",
+                "label",
+                "count",
+                "current_count",
+                "historical_count",
+                "observation_count",
+                "is_current",
+            ):
+                assert slim_edge["data"][key] == full_edge["data"][key]
+
+
+def test_filter_service_connections_matches_protocol_state_process():
+    services = [
+        {
+            "protocol": "tcp",
+            "state": "ESTABLISHED",
+            "process_name": "nginx",
+            "pid": 100,
+            "observed_pids": [100, 200],
+        },
+        {
+            "protocol": "udp",
+            "state": None,
+            "process_name": "dnsmasq",
+            "pid": 300,
+            "observed_pids": [300],
+        },
+        {
+            "protocol": "tcp",
+            "state": "CLOSE_WAIT",
+            "process_name": "worker",
+            "pid": None,
+            "observed_pids": [],
+        },
+    ]
+
+    assert len(filter_service_connections(services, protocol="tcp")) == 2
+    assert len(filter_service_connections(services, protocol="udp")) == 1
+    assert [
+        row["process_name"]
+        for row in filter_service_connections(services, state="ESTABLISHED")
+    ] == ["nginx"]
+    assert [
+        row["process_name"]
+        for row in filter_service_connections(services, process="NGINX")
+    ] == ["nginx"]
+    assert [
+        row["process_name"]
+        for row in filter_service_connections(services, process="200")
+    ] == ["nginx"]
+    assert [
+        row["process_name"]
+        for row in filter_service_connections(services, process="30")
+    ] == ["dnsmasq"]
+    assert (
+        filter_service_connections(
+            services, protocol="tcp", state="ESTABLISHED", process="worker"
+        )
+        == []
+    )
+    assert filter_service_connections(services) == services
+
+
+def _production_database_pair(session, app):
+    production = Cluster(name="pair-production")
+    database = Cluster(name="pair-database")
+    session.add_all([production, database])
+    session.flush()
+    web = add_device(session, app, "pair-web", "10.0.0.1", production)
+    db = add_device(session, app, "pair-db", "10.0.1.1", database)
+    add_scan(session, web, ["10.0.1.1", "203.0.113.8"])
+    session.commit()
+    return production, database, web, db
+
+
+def test_build_edge_connections_matches_full_graph_edge(app):
+    with app.state.session_factory() as session:
+        production, database, web, _ = _production_database_pair(session, app)
+
+        full = build_cluster_topology(session, LiteralResolver(), window="1d")
+        expected = next(
+            edge["data"]["connections"]
+            for edge in full["edges"]
+            if edge["data"]["source"] == f"cluster-{production.id}"
+            and edge["data"]["target"] == f"cluster-{database.id}"
+        )
+        rows = build_edge_connections(
+            session,
+            LiteralResolver(),
+            source_id=f"cluster-{production.id}",
+            target_id=f"cluster-{database.id}",
+            window="1d",
+        )
+
+        assert len(rows) == 1
+        assert len(expected) == 1
+        assert rows[0]["remote_ip"] == "10.0.1.1"
+        assert rows[0]["source_device_id"] == web.id
+        assert rows[0]["target_device_name"] == "pair-db"
+        assert rows[0]["observation_count"] == expected[0]["observation_count"]
+        assert rows[0]["first_seen"] == expected[0]["first_seen"]
+
+        external_rows = build_edge_connections(
+            session,
+            LiteralResolver(),
+            source_id=f"cluster-{production.id}",
+            target_id="external-203.0.113.8",
+            window="1d",
+        )
+        assert [row["remote_ip"] for row in external_rows] == ["203.0.113.8"]
+
+        filtered = build_edge_connections(
+            session,
+            LiteralResolver(),
+            source_id=f"cluster-{production.id}",
+            target_id=f"cluster-{database.id}",
+            window="1d",
+            protocol="udp",
+        )
+        assert filtered == []
+
+
+def test_edge_connections_api_serves_slim_graph_and_details(app, client):
+    with app.state.session_factory() as session:
+        production, database, _, _ = _production_database_pair(session, app)
+        production_id = production.id
+        database_id = database.id
+
+    graph_response = client.get(
+        "/api/topology/clusters",
+        params={"window": "1d", "cluster_id": production_id},
+    )
+    assert graph_response.status_code == 200
+    graph = graph_response.json()
+    assert graph["edges"]
+    assert all(
+        "connections" not in edge["data"] for edge in graph["edges"]
+    )
+    edge = next(
+        item
+        for item in graph["edges"]
+        if item["data"]["target"] == f"cluster-{database_id}"
+    )
+    assert edge["data"]["count"] == 1
+
+    details_response = client.get(
+        "/api/topology/edge-connections",
+        params={
+            "window": "1d",
+            "source": edge["data"]["source"],
+            "target": edge["data"]["target"],
+        },
+    )
+    assert details_response.status_code == 200
+    details = details_response.json()
+    assert [row["remote_ip"] for row in details["connections"]] == ["10.0.1.1"]
+
+    filtered_response = client.get(
+        "/api/topology/edge-connections",
+        params={
+            "window": "1d",
+            "source": edge["data"]["source"],
+            "target": edge["data"]["target"],
+            "process": "no-such-process",
+        },
+    )
+    assert filtered_response.status_code == 200
+    assert filtered_response.json()["connections"] == []

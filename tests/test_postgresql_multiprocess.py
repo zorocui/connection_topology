@@ -265,6 +265,16 @@ def test_real_two_worker_uvicorn_health_smoke(test_database_url, valid_key):
         errors="replace",
     )
     output = ""
+    # Drain stdout continuously: access logs from the request burst below
+    # would otherwise fill the pipe buffer and block the uvicorn workers.
+    output_parts: list[str] = []
+
+    def _drain_stdout() -> None:
+        assert process.stdout is not None
+        output_parts.extend(process.stdout)
+
+    drain_thread = threading.Thread(target=_drain_stdout, daemon=True)
+    drain_thread.start()
     try:
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -287,7 +297,9 @@ def test_real_two_worker_uvicorn_health_smoke(test_database_url, valid_key):
         assert all(b'"database":"ok"' in body for body in bodies)
         assert all(b'"migration":"current"' in body for body in bodies)
     finally:
-        output = _stop_process_tree(process)
+        remaining = _stop_process_tree(process)
+        drain_thread.join(timeout=5)
+        output = "".join(output_parts) + (remaining or "")
     lowered = output.lower()
     assert "migration race" not in lowered
     assert "duplicate scheduler" not in lowered

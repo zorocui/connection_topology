@@ -11,9 +11,11 @@ from app.database import (
     create_database_engine,
     create_session_factory,
 )
+from app.logging_config import configure_logging
 from app.models import SystemSetting
 from app.routes import api, pages
-from app.security import CredentialCipher, SecretRedactingFilter
+from app.runtime import resolve_web_workers
+from app.security import CredentialCipher
 from app.services.database_transactions import PostgresTransactionRunner
 from app.services.import_testing import ImportTestService
 from app.services.postgres_notifications import (
@@ -25,9 +27,13 @@ from app.services.scheduler import SchedulerService
 from app.services.topology import HostAddressResolver
 from app.services.topology_cache import TopologyCache
 
+logger = logging.getLogger(__name__)
+
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or get_settings()
+    log_dir = configure_logging(resolved)
+    logger.info("日志系统初始化完成 level=%s dir=%s", resolved.log_level, log_dir)
     engine = create_database_engine(resolved)
     session_factory = create_session_factory(engine)
     cipher = CredentialCipher(resolved.app_secret_key)
@@ -39,6 +45,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         assert_database_current(engine)
         app.state.migration_current = True
+        logger.info("数据库迁移校验通过")
 
         def initialize_settings(session):
             setting = session.get(SystemSetting, 1)
@@ -51,11 +58,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
 
         transaction_runner.run("initialize_settings", initialize_settings)
+        logger.info("系统设置初始化完成 retention_days=%s", resolved.history_retention_days)
         app.state.scan_queue.start()
         app.state.import_test_service.start()
         if app.state.scheduler:
             app.state.scheduler.start()
         app.state.topology_listener.start()
+        logger.info(
+            "应用启动完成 host=%s port=%s web_workers=%s scheduler=%s",
+            resolved.host,
+            resolved.port,
+            resolve_web_workers(resolved.web_workers),
+            "enabled" if app.state.scheduler else "disabled",
+        )
         try:
             yield
         finally:
@@ -65,6 +80,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.scan_queue.shutdown()
             app.state.topology_listener.shutdown()
             engine.dispose()
+            logger.info("应用已关闭，所有后台服务已停止")
 
     app = FastAPI(
         title="连接图谱",
@@ -81,7 +97,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.address_resolver = HostAddressResolver()
     app.state.linux_collector = LinuxCollector(resolved.remote_timeout_seconds)
     app.state.windows_collector = WindowsCollector(resolved.remote_timeout_seconds)
-    app.state.topology_cache = TopologyCache(ttl_seconds=30)
+    app.state.topology_cache = TopologyCache(ttl_seconds=300)
     app.state.topology_listener = PostgresNotificationListener(
         resolved.database_url,
         TOPOLOGY_CHANNEL,
@@ -119,6 +135,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             resolved.scan_jitter_seconds,
             transaction_runner,
             on_history_purged=app.state.topology_cache.clear,
+            raw_retention_days=resolved.raw_retention_days,
         )
         if resolved.scheduler_enabled
         else None
@@ -126,10 +143,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.mount("/static", StaticFiles(directory="app/static"), name="static")
     app.include_router(pages.router)
     app.include_router(api.router)
-
-    redactor = SecretRedactingFilter()
-    for handler in logging.getLogger().handlers:
-        handler.addFilter(redactor)
     return app
 
 

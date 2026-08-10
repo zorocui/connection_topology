@@ -15,7 +15,9 @@ fi
 
 "$PY" -m alembic upgrade head
 
-read -r WORKERS HOST PORT < <("$PY" -c "from app.config import get_settings; from app.runtime import resolve_web_workers; s=get_settings(); print(resolve_web_workers(s.web_workers), s.host, s.port)")
+read -r WORKERS HOST PORT <<EOF
+$("$PY" -c "from app.config import get_settings; from app.runtime import resolve_web_workers; s=get_settings(); print(resolve_web_workers(s.web_workers), s.host, s.port)")
+EOF
 
 "$PY" -m app.preflight --workers "$WORKERS"
 

@@ -2,7 +2,8 @@ import ipaddress
 import socket
 import threading
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
@@ -233,13 +234,21 @@ def _is_cluster_internal_address(
     )
 
 
-def build_cluster_topology(
+@dataclass(frozen=True)
+class ClusterGraphContext:
+    devices: tuple[Device, ...]
+    clusters: tuple[Cluster, ...]
+    devices_by_id: dict[int, Device]
+    cluster_members: dict[int, list[Device]]
+    address_owners: dict[str, list[Device]]
+    networks_by_cluster: dict[int, tuple[ipaddress.IPv4Network, ...]]
+    warnings: list[str]
+
+
+def load_cluster_graph_context(
     session: Session,
     resolver: HostAddressResolver,
-    window: TopologyWindow = "current",
-    now: datetime | None = None,
-    target_cluster_id: int | None = None,
-) -> dict:
+) -> ClusterGraphContext:
     devices = session.scalars(
         select(Device)
         .options(selectinload(Device.cluster))
@@ -250,12 +259,6 @@ def build_cluster_topology(
         .options(selectinload(Cluster.internal_networks))
         .order_by(Cluster.name)
     ).all()
-    if (
-        target_cluster_id is not None
-        and not any(cluster.id == target_cluster_id for cluster in clusters)
-    ):
-        raise ValueError("集群不存在")
-    devices_by_id = {device.id: device for device in devices}
 
     warnings: list[str] = []
     networks_by_cluster = _cluster_network_map(clusters, warnings)
@@ -275,11 +278,128 @@ def build_cluster_topology(
         if device.cluster_id:
             cluster_members[device.cluster_id].append(device)
 
+    return ClusterGraphContext(
+        devices=tuple(devices),
+        clusters=tuple(clusters),
+        devices_by_id={device.id: device for device in devices},
+        cluster_members=dict(cluster_members),
+        address_owners=dict(address_owners),
+        networks_by_cluster=networks_by_cluster,
+        warnings=warnings,
+    )
+
+
+def filter_service_connections(
+    services: Sequence[dict],
+    *,
+    protocol: str | None = None,
+    state: str | None = None,
+    process: str | None = None,
+) -> list[dict]:
+    process_query = process.strip().lower() if process else ""
+    if not protocol and not state and not process_query:
+        return list(services)
+    rows = []
+    for service in services:
+        if protocol and service["protocol"] != protocol:
+            continue
+        if state and service["state"] != state:
+            continue
+        if process_query:
+            observed = service.get("observed_pids") or ()
+            pids = " ".join(str(pid) for pid in observed)
+            if not pids and service.get("pid") is not None:
+                pids = str(service["pid"])
+            haystack = f"{service.get('process_name') or ''} {pids}".lower()
+            if process_query not in haystack:
+                continue
+        rows.append(service)
+    return rows
+
+
+def _service_edge_target(
+    service: dict,
+    source_device: Device,
+    context: ClusterGraphContext,
+) -> tuple[str, Device | None] | None:
+    normalized_remote = service["remote_ip"]
+    owners = context.address_owners.get(normalized_remote, [])
+    target_device = owners[0] if len(owners) == 1 else None
+    if target_device is not None:
+        if target_device.id == source_device.id:
+            return None
+        if (
+            source_device.cluster_id is not None
+            and source_device.cluster_id == target_device.cluster_id
+        ):
+            return None
+        return _managed_node_id(target_device), target_device
+    if not owners and _is_cluster_internal_address(
+        normalized_remote,
+        source_device.cluster_id,
+        context.networks_by_cluster,
+    ):
+        return None
+    return f"external-{normalized_remote}", None
+
+
+def group_cluster_edges(
+    services: Sequence[dict],
+    context: ClusterGraphContext,
+) -> dict[tuple[str, str], list[dict]]:
+    edge_groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for service in services:
+        source_device = context.devices_by_id[service["source_device_id"]]
+        source_id = _managed_node_id(source_device)
+        mapped = _service_edge_target(service, source_device, context)
+        if mapped is None:
+            continue
+        target_id, target_device = mapped
+        if source_id == target_id:
+            continue
+        edge_groups[(source_id, target_id)].append(
+            {
+                **service,
+                "source_device_name": source_device.name,
+                "target_device_id": (
+                    target_device.id if target_device else None
+                ),
+                "target_device_name": (
+                    target_device.name if target_device else None
+                ),
+            }
+        )
+    return edge_groups
+
+
+def build_cluster_topology(
+    session: Session,
+    resolver: HostAddressResolver,
+    window: TopologyWindow = "current",
+    now: datetime | None = None,
+    target_cluster_id: int | None = None,
+    embed_connections: bool = True,
+    protocol: str | None = None,
+    state: str | None = None,
+    process: str | None = None,
+) -> dict:
+    context = load_cluster_graph_context(session, resolver)
+    devices = context.devices
+    clusters = context.clusters
+    if (
+        target_cluster_id is not None
+        and not any(cluster.id == target_cluster_id for cluster in clusters)
+    ):
+        raise ValueError("集群不存在")
+    devices_by_id = context.devices_by_id
+    warnings = list(context.warnings)
+    cluster_members = context.cluster_members
+
     device_ids = [device.id for device in devices]
     latest_scans = load_current_scans(
         session,
         device_ids,
-        with_connections=target_cluster_id is None and window == "current",
+        with_connections=False,
     )
     current_scan_ids = {scan.id for scan in latest_scans.values()}
     source_device_ids = None
@@ -299,18 +419,11 @@ def build_cluster_topology(
             if ":" not in address
         )
     if window == "current":
-        services = (
-            aggregate_service_connections(
-                list(latest_scans.values()),
-                current_scan_ids,
-            )
-            if target_cluster_id is None
-            else aggregate_current_connections(
-                session,
-                latest_scans,
-                source_device_ids=source_device_ids,
-                inbound_addresses=inbound_addresses,
-            )
+        services = aggregate_current_connections(
+            session,
+            latest_scans,
+            source_device_ids=source_device_ids,
+            inbound_addresses=inbound_addresses,
         )
     else:
         services = aggregate_historical_connections(
@@ -322,6 +435,12 @@ def build_cluster_topology(
             source_device_ids=source_device_ids,
             inbound_addresses=inbound_addresses,
         )
+    services = filter_service_connections(
+        services,
+        protocol=protocol,
+        state=state,
+        process=process,
+    )
 
     nodes_by_id: dict[str, dict] = {}
     for cluster in clusters:
@@ -372,53 +491,22 @@ def build_cluster_topology(
                 }
             }
 
-    edge_groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    for service in services:
-        source_device = devices_by_id[service["source_device_id"]]
-        source_id = _managed_node_id(source_device)
-        normalized_remote = service["remote_ip"]
-        owners = address_owners.get(normalized_remote, [])
-        target_device = owners[0] if len(owners) == 1 else None
-        if target_device is not None:
-            if target_device.id == source_device.id:
-                continue
-            if (
-                source_device.cluster_id is not None
-                and source_device.cluster_id == target_device.cluster_id
-            ):
-                continue
-            target_id = _managed_node_id(target_device)
-            target_name = target_device.name
-        else:
-            if not owners and _is_cluster_internal_address(
-                normalized_remote,
-                source_device.cluster_id,
-                networks_by_cluster,
-            ):
-                continue
-            target_id = f"external-{normalized_remote}"
-            target_name = normalized_remote
-            nodes_by_id.setdefault(
-                target_id,
-                {
-                    "data": {
-                        "id": target_id,
-                        "label": normalized_remote,
-                        "kind": "external",
-                        "subtitle": "外部地址",
-                        "members": [],
-                    }
-                },
-            )
-        if source_id == target_id:
+    edge_groups = group_cluster_edges(services, context)
+    for _, target_id in edge_groups:
+        if not target_id.startswith("external-"):
             continue
-        edge_groups[(source_id, target_id)].append(
+        normalized_remote = target_id.removeprefix("external-")
+        nodes_by_id.setdefault(
+            target_id,
             {
-                **service,
-                "source_device_name": source_device.name,
-                "target_device_id": target_device.id if target_device else None,
-                "target_device_name": target_name if target_device else None,
-            }
+                "data": {
+                    "id": target_id,
+                    "label": normalized_remote,
+                    "kind": "external",
+                    "subtitle": "外部地址",
+                    "members": [],
+                }
+            },
         )
 
     edges = []
@@ -430,22 +518,20 @@ def build_cluster_topology(
         observation_count = sum(
             detail["observation_count"] for detail in details
         )
-        edges.append(
-            {
-                "data": {
-                    "id": f"cluster-edge-{index}",
-                    "source": source_id,
-                    "target": target_id,
-                    "label": str(len(details)),
-                    "count": len(details),
-                    "current_count": current_count,
-                    "historical_count": historical_count,
-                    "observation_count": observation_count,
-                    "is_current": current_count > 0,
-                    "connections": details,
-                }
-            }
-        )
+        edge_data = {
+            "id": f"cluster-edge-{index}",
+            "source": source_id,
+            "target": target_id,
+            "label": str(len(details)),
+            "count": len(details),
+            "current_count": current_count,
+            "historical_count": historical_count,
+            "observation_count": observation_count,
+            "is_current": current_count > 0,
+        }
+        if embed_connections:
+            edge_data["connections"] = details
+        edges.append({"data": edge_data})
     nodes = list(nodes_by_id.values())
     if target_cluster_id is not None:
         target_node_id = f"cluster-{target_cluster_id}"
@@ -471,3 +557,99 @@ def build_cluster_topology(
         "edges": edges,
         "warnings": warnings,
     }
+
+
+def _node_source_devices(
+    node_id: str,
+    context: ClusterGraphContext,
+) -> list[Device]:
+    if node_id.startswith("cluster-"):
+        try:
+            cluster_id = int(node_id.removeprefix("cluster-"))
+        except ValueError:
+            return []
+        return list(context.cluster_members.get(cluster_id, []))
+    if node_id.startswith("device-"):
+        try:
+            device_id = int(node_id.removeprefix("device-"))
+        except ValueError:
+            return []
+        device = context.devices_by_id.get(device_id)
+        return [device] if device is not None else []
+    return []
+
+
+def _node_target_addresses(
+    node_id: str,
+    context: ClusterGraphContext,
+    resolver: HostAddressResolver,
+) -> set[str]:
+    if node_id.startswith("external-"):
+        return {node_id.removeprefix("external-")}
+    devices = _node_source_devices(node_id, context)
+    addresses = {
+        address
+        for device in devices
+        for address in resolver.resolve(device.host)
+    }
+    addresses.update(
+        f"::ffff:{address}"
+        for address in tuple(addresses)
+        if ":" not in address
+    )
+    return addresses
+
+
+def build_edge_connections(
+    session: Session,
+    resolver: HostAddressResolver,
+    *,
+    source_id: str,
+    target_id: str,
+    window: TopologyWindow,
+    now: datetime | None = None,
+    protocol: str | None = None,
+    state: str | None = None,
+    process: str | None = None,
+) -> list[dict]:
+    """Connections of one graph edge, aggregated on demand.
+
+    The pair narrows the observation query with AND semantics (source
+    devices x target addresses), then the shared edge-grouping rules keep
+    only services that the graph would place on this exact edge.
+    """
+    context = load_cluster_graph_context(session, resolver)
+    source_devices = _node_source_devices(source_id, context)
+    target_addresses = _node_target_addresses(target_id, context, resolver)
+    if not source_devices or not target_addresses:
+        return []
+    source_device_ids = {device.id for device in source_devices}
+    latest_scans = load_current_scans(
+        session,
+        source_device_ids,
+        with_connections=False,
+    )
+    current_scan_ids = {scan.id for scan in latest_scans.values()}
+    if window == "current":
+        services = aggregate_current_connections(
+            session,
+            latest_scans,
+            remote_addresses=target_addresses,
+        )
+    else:
+        services = aggregate_historical_connections(
+            session,
+            source_device_ids,
+            current_scan_ids,
+            window,
+            now=now,
+            remote_addresses=target_addresses,
+        )
+    services = filter_service_connections(
+        services,
+        protocol=protocol,
+        state=state,
+        process=process,
+    )
+    edge_groups = group_cluster_edges(services, context)
+    return edge_groups.get((source_id, target_id), [])

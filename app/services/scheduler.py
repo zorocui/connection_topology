@@ -5,10 +5,17 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from sqlalchemy import delete, select
+from sqlalchemy import delete, desc, func, select
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
-from app.models import Device, ScanRun, ScanTrigger, SystemSetting
+from app.models import (
+    ConnectionRecord,
+    Device,
+    ScanRun,
+    ScanStatus,
+    ScanTrigger,
+    SystemSetting,
+)
 from app.services.database_transactions import PostgresTransactionRunner
 from app.services.postgres_leader import (
     SCHEDULER_LEADER_LOCK_KEY,
@@ -25,12 +32,45 @@ from app.services.scan_queue import (
 
 logger = logging.getLogger(__name__)
 
+# Scan runs deleted per purge batch. At steady state a full retention window
+# can cascade to tens of millions of rows, so purges commit in small chunks
+# instead of one long transaction (WAL spikes, lock hold time).
+PURGE_SCAN_CHUNK_SIZE = 2000
+
+# Raw connection records are only read back for the latest successful scan
+# per device (current topology) and the one before it (scan diff), so the
+# raw purge always keeps those two baselines per device even when they are
+# older than the cutoff. History views read connection_service_observations
+# and are unaffected.
+RAW_RETENTION_KEPT_SCANS_PER_DEVICE = 2
+
+
+def _delete_scans_in_chunks(
+    session: Session,
+    conditions: list,
+    chunk_size: int,
+) -> int:
+    deleted = 0
+    while True:
+        scan_ids = session.scalars(
+            select(ScanRun.id)
+            .where(*conditions)
+            .order_by(ScanRun.id)
+            .limit(chunk_size)
+        ).all()
+        if not scan_ids:
+            return deleted
+        result = session.execute(delete(ScanRun).where(ScanRun.id.in_(scan_ids)))
+        session.commit()
+        deleted += result.rowcount or 0
+
 
 def purge_expired_scans(
     session: Session,
     system_days: int,
     *,
     now: datetime | None = None,
+    chunk_size: int = PURGE_SCAN_CHUNK_SIZE,
 ) -> int:
     reference = now or datetime.now(timezone.utc)
     devices = session.scalars(
@@ -44,17 +84,74 @@ def purge_expired_scans(
     deleted = 0
     for retention_days, device_ids in groups.items():
         cutoff = reference - timedelta(days=retention_days)
-        result = session.execute(
-            delete(ScanRun).where(
-                ScanRun.device_id.in_(device_ids),
-                ScanRun.started_at < cutoff,
-            )
+        deleted += _delete_scans_in_chunks(
+            session,
+            [ScanRun.device_id.in_(device_ids), ScanRun.started_at < cutoff],
+            chunk_size,
         )
-        deleted += result.rowcount or 0
     if deleted:
         notify_topology_changed(session)
-    session.commit()
+        session.commit()
     return deleted
+
+
+def purge_raw_connection_records(
+    session: Session,
+    raw_days: int,
+    *,
+    now: datetime | None = None,
+    chunk_size: int = PURGE_SCAN_CHUNK_SIZE,
+) -> int:
+    """Delete raw connection rows older than ``raw_days`` while keeping the
+    scan_runs and service observations for the full history retention.
+
+    Returns the number of deleted connection rows. The per-device latest two
+    successful scans keep their raw rows so the current topology and the
+    latest diff keep working for devices that stopped reporting.
+    """
+    reference = now or datetime.now(timezone.utc)
+    cutoff = reference - timedelta(days=raw_days)
+    ranked = (
+        select(
+            ScanRun.id.label("scan_id"),
+            func.row_number()
+            .over(
+                partition_by=ScanRun.device_id,
+                order_by=(desc(ScanRun.started_at), desc(ScanRun.id)),
+            )
+            .label("position"),
+        )
+        .where(ScanRun.status == ScanStatus.SUCCESS)
+        .subquery()
+    )
+    kept_scan_ids = select(ranked.c.scan_id).where(
+        ranked.c.position <= RAW_RETENTION_KEPT_SCANS_PER_DEVICE
+    )
+    deleted = 0
+    # Watermark on scan id: the scan rows themselves survive this purge, so a
+    # plain re-select would return the same ids forever.
+    last_scan_id = 0
+    while True:
+        scan_ids = session.scalars(
+            select(ScanRun.id)
+            .where(
+                ScanRun.started_at < cutoff,
+                ScanRun.id > last_scan_id,
+                ScanRun.id.not_in(kept_scan_ids),
+            )
+            .order_by(ScanRun.id)
+            .limit(chunk_size)
+        ).all()
+        if not scan_ids:
+            return deleted
+        result = session.execute(
+            delete(ConnectionRecord).where(
+                ConnectionRecord.scan_run_id.in_(scan_ids)
+            )
+        )
+        session.commit()
+        deleted += result.rowcount or 0
+        last_scan_id = scan_ids[-1]
 
 
 class SchedulerService:
@@ -65,10 +162,12 @@ class SchedulerService:
         scan_jitter_seconds: int,
         transaction_runner: PostgresTransactionRunner | None = None,
         on_history_purged: Callable[[], None] | None = None,
+        raw_retention_days: int = 2,
     ) -> None:
         self.session_factory = session_factory
         self.scan_queue = scan_queue
         self.scan_jitter_seconds = scan_jitter_seconds
+        self.raw_retention_days = raw_retention_days
         self.transaction_runner = transaction_runner or PostgresTransactionRunner(
             session_factory,
             (0.1, 0.3),
@@ -104,9 +203,19 @@ class SchedulerService:
             self.session_factory() as session,
         ):
             setting = session.get(SystemSetting, 1)
-            purge_expired_scans(
+            raw_deleted = purge_raw_connection_records(
+                session,
+                self.raw_retention_days,
+            )
+            deleted = purge_expired_scans(
                 session,
                 setting.history_retention_days if setting else 7,
+            )
+        if raw_deleted or deleted:
+            logger.info(
+                "历史清理完成：删除原始连接 %s 行、扫描快照 %s 个",
+                raw_deleted,
+                deleted,
             )
         if self.on_history_purged is not None:
             self.on_history_purged()

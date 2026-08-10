@@ -11,6 +11,7 @@ htmlcov/
 *.db-wal
 *.sqlite3
 *.log
+logs/
 *.tar.gz
 outputs/
 backups/

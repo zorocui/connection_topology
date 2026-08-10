@@ -302,9 +302,6 @@ class ScanBatchItem(Base):
 class ConnectionRecord(Base):
     __tablename__ = "connection_records"
     __table_args__ = (
-        Index("ix_connection_scan_protocol", "scan_run_id", "protocol"),
-        Index("ix_connection_scan_remote", "scan_run_id", "remote_ip"),
-        Index("ix_connection_scan_process", "scan_run_id", "process_name"),
         Index(
             "ix_connection_history_service",
             "scan_run_id",
@@ -312,11 +309,6 @@ class ConnectionRecord(Base):
             "remote_port",
             "protocol",
             "process_name",
-        ),
-        Index(
-            "ix_connection_remote_scan",
-            "remote_ip",
-            "scan_run_id",
         ),
     )
 
@@ -328,12 +320,52 @@ class ConnectionRecord(Base):
     local_port: Mapped[int] = mapped_column(Integer)
     remote_ip: Mapped[str | None] = mapped_column(String(255), nullable=True)
     remote_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    state: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    state: Mapped[str | None] = mapped_column(String(32), nullable=True)
     pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     process_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     remote_hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     scan_run: Mapped[ScanRun] = relationship(back_populates="connections")
+
+
+class ConnectionServiceObservation(Base):
+    __tablename__ = "connection_service_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "scan_run_id",
+            "protocol",
+            "remote_ip",
+            "remote_port",
+            "process_name",
+            name="uq_observation_scan_service",
+        ),
+        Index("ix_observation_device_started", "device_id", "started_at"),
+        Index("ix_observation_remote_started", "remote_ip", "started_at"),
+        Index("ix_observation_scan", "scan_run_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scan_run_id: Mapped[int] = mapped_column(
+        ForeignKey("scan_runs.id", ondelete="CASCADE")
+    )
+    device_id: Mapped[int] = mapped_column(
+        ForeignKey("devices.id", ondelete="CASCADE")
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    protocol: Mapped[str] = mapped_column(String(8))
+    remote_ip: Mapped[str] = mapped_column(String(255))
+    # remote_port/process_name store the coalesced group key (0 / "") so the
+    # unique constraint stays effective; display values come from the sample
+    # connection record.
+    remote_port: Mapped[int] = mapped_column(Integer, default=0)
+    process_name: Mapped[str] = mapped_column(String(255), default="")
+    sample_connection_id: Mapped[int] = mapped_column(Integer)
+    remote_hostname: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    local_ips: Mapped[str] = mapped_column(Text)
+    local_ports: Mapped[str] = mapped_column(Text)
+    pids: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class SystemSetting(Base):

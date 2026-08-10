@@ -3,10 +3,41 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 
+_normalize_cache: dict[str, str | None] = {}
+_CACHE_MISS = object()
+
+
+def _is_canonical_ipv4(candidate: str) -> bool:
+    parts = candidate.split(".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        if (
+            not part.isascii()
+            or not part.isdigit()
+            or len(part) > 3
+            or (len(part) > 1 and part[0] == "0")
+            or int(part) > 255
+        ):
+            return False
+    return True
+
+
 def normalize_ip_address(address: str | None) -> str | None:
     if address is None:
         return None
+    cached = _normalize_cache.get(address, _CACHE_MISS)
+    if cached is not _CACHE_MISS:
+        return cached
+    result = _normalize_ip_address_uncached(address)
+    _normalize_cache[address] = result
+    return result
+
+
+def _normalize_ip_address_uncached(address: str) -> str:
     candidate = address.split("%", 1)[0]
+    if _is_canonical_ipv4(candidate):
+        return candidate
     try:
         parsed = ipaddress.ip_address(candidate)
     except ValueError:
@@ -19,6 +50,10 @@ def normalize_ip_address(address: str | None) -> str | None:
 def is_loopback_address(address: str | None) -> bool:
     normalized = normalize_ip_address(address)
     if normalized is None:
+        return False
+    if _is_canonical_ipv4(normalized):
+        return normalized.split(".", 1)[0] == "127"
+    if ":" not in normalized:
         return False
     try:
         return ipaddress.ip_address(normalized).is_loopback

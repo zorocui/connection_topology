@@ -2,13 +2,31 @@ from __future__ import annotations
 
 from collections.abc import Collection, Iterable, Sequence
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Literal
 
-from sqlalchemy import String, case, cast, desc, func, literal, or_, select
+from sqlalchemy import (
+    Integer,
+    String,
+    bindparam,
+    case,
+    cast,
+    desc,
+    func,
+    literal,
+    or_,
+    select,
+)
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Session, selectinload
 
 from app.collectors.base import is_loopback_address, normalize_ip_address
-from app.models import ConnectionRecord, ScanRun, ScanStatus
+from app.models import (
+    ConnectionRecord,
+    ConnectionServiceObservation,
+    ScanRun,
+    ScanStatus,
+)
 
 TopologyWindow = Literal["current", "1d", "3d", "7d"]
 WINDOW_DELTAS = {
@@ -61,44 +79,6 @@ def load_current_scans(
         .options(*options)
     ).all()
     return {scan.device_id: scan for scan in scans}
-
-
-def load_topology_scans(
-    session: Session,
-    device_ids: Collection[int],
-    window: TopologyWindow,
-    now: datetime | None = None,
-) -> tuple[dict[int, ScanRun], list[ScanRun]]:
-    ids = sorted(set(device_ids))
-    if not ids:
-        return {}, []
-
-    current = load_current_scans(session, ids)
-    current_ids = [scan.id for scan in current.values()]
-    if not current_ids:
-        return {}, []
-
-    conditions = [ScanRun.id.in_(current_ids)]
-    if window != "current":
-        reference = now or datetime.now(timezone.utc)
-        conditions.append(ScanRun.started_at >= reference - WINDOW_DELTAS[window])
-
-    scans = list(
-        session.scalars(
-            select(ScanRun)
-            .where(
-                ScanRun.device_id.in_(ids),
-                ScanRun.status == ScanStatus.SUCCESS,
-                or_(*conditions),
-            )
-            .options(
-                selectinload(ScanRun.device),
-                selectinload(ScanRun.connections),
-            )
-            .order_by(ScanRun.started_at, ScanRun.id)
-        )
-    )
-    return current, scans
 
 
 def _service_key(device_id: int, row: ConnectionRecord) -> tuple:
@@ -187,59 +167,6 @@ def aggregate_service_connections(
     return _aggregate_connection_observations(observations, current_scan_ids)
 
 
-def _candidate_connection_ids(
-    scan_conditions,
-    *,
-    source_device_ids: Collection[int] | None = None,
-    inbound_addresses: Collection[str] | None = None,
-):
-    base = (
-        select(ConnectionRecord.id)
-        .join(ScanRun, ScanRun.id == ConnectionRecord.scan_run_id)
-        .where(*scan_conditions, ConnectionRecord.remote_ip.is_not(None))
-    )
-    if source_device_ids is None and inbound_addresses is None:
-        return base
-    sources = sorted(set(source_device_ids or ()))
-    addresses = sorted(set(inbound_addresses or ()))
-    outbound = base.where(ScanRun.device_id.in_(sources))
-    inbound = base.where(ConnectionRecord.remote_ip.in_(addresses))
-    return outbound.union(inbound)
-
-
-def aggregate_current_connections(
-    session: Session,
-    current_scans: dict[int, ScanRun],
-    *,
-    source_device_ids: Collection[int] | None = None,
-    inbound_addresses: Collection[str] | None = None,
-) -> list[dict]:
-    current_ids = {scan.id for scan in current_scans.values()}
-    if not current_ids:
-        return []
-    candidate_ids = _candidate_connection_ids(
-        [ScanRun.id.in_(current_ids)],
-        source_device_ids=source_device_ids,
-        inbound_addresses=inbound_addresses,
-    )
-    connections = session.scalars(
-        select(ConnectionRecord)
-        .where(ConnectionRecord.id.in_(candidate_ids))
-        .order_by(ConnectionRecord.scan_run_id, ConnectionRecord.id)
-    ).all()
-    scans_by_id = {scan.id: scan for scan in current_scans.values()}
-    observations = (
-        (
-            connection.scan_run_id,
-            scans_by_id[connection.scan_run_id].device_id,
-            scans_by_id[connection.scan_run_id].started_at,
-            connection,
-        )
-        for connection in connections
-    )
-    return _aggregate_connection_observations(observations, current_ids)
-
-
 def _csv_int_set(value: str | None) -> set[int]:
     return {int(item) for item in value.split(",")} if value else set()
 
@@ -248,81 +175,103 @@ def _csv_str_set(value: str | None) -> set[str]:
     return set(value.split(",")) if value else set()
 
 
-def aggregate_historical_connections(
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _degraded_sample(
+    row,
+    marker_parts: list[str],
+    local_ips: set[str],
+    local_ports: set[int],
+    pids: set[int],
+) -> SimpleNamespace | None:
+    """Stand-in for a sample connection row that no longer exists.
+
+    Raw records are purged ahead of observations (raw retention), and a
+    history purge can also delete a sample row between the aggregate and
+    sample queries. Rebuilding the sample from observation data keeps the
+    service group visible in history windows; single-value fields fall back
+    to the aggregated CSVs and ``state`` degrades to None. The marker packs
+    epoch-micros|scan_run_id|sample_connection_id (see ``latest_marker``).
+    """
+    if not local_ips:
+        return None
+    epoch_micros, scan_id, sample_id = (int(part) for part in marker_parts)
+    return SimpleNamespace(
+        connection_id=sample_id,
+        protocol=row.protocol,
+        local_ip=min(local_ips),
+        local_port=min(local_ports, default=None),
+        remote_port=row.remote_port or None,
+        state=None,
+        pid=min(pids, default=None),
+        process_name=row.process_key or None,
+        scan_id=scan_id,
+        started_at=_EPOCH + timedelta(microseconds=epoch_micros),
+        device_id=row.device_id,
+    )
+
+
+def _aggregate_observation_groups(
     session: Session,
     device_ids: Collection[int],
     current_scan_ids: Collection[int],
-    window: TopologyWindow,
     *,
-    now: datetime | None = None,
+    cutoff: datetime | None,
     source_device_ids: Collection[int] | None = None,
     inbound_addresses: Collection[str] | None = None,
+    remote_addresses: Collection[str] | None = None,
 ) -> list[dict]:
-    if window == "current":
-        raise ValueError("历史聚合不接受 current 时间范围")
+    """Aggregate per-scan service observations into service groups.
+
+    Reads connection_service_observations (one row per successful scan and
+    service key) instead of raw connection records, so the input stays
+    proportional to distinct services rather than to raw row counts. When
+    cutoff is None only observations from the current scans are aggregated.
+    """
     ids = sorted(set(device_ids))
     if not ids:
         return []
 
     current_ids = set(current_scan_ids)
-    reference = now or datetime.now(timezone.utc)
-    cutoff = reference - WINDOW_DELTAS[window]
-    process_key = func.coalesce(ConnectionRecord.process_name, "").label(
-        "process_key"
-    )
-    conditions = [
-        ScanRun.device_id.in_(ids),
-        ScanRun.status == ScanStatus.SUCCESS,
-        or_(
-            ScanRun.started_at >= cutoff,
-            ScanRun.id.in_(current_ids),
-        ),
-        ConnectionRecord.remote_ip.is_not(None),
-    ]
+    observation = ConnectionServiceObservation
+    conditions = [observation.device_id.in_(ids)]
+    if cutoff is None:
+        conditions.append(observation.scan_run_id.in_(current_ids))
+    else:
+        conditions.append(
+            or_(
+                observation.started_at >= cutoff,
+                observation.scan_run_id.in_(current_ids),
+            )
+        )
     if source_device_ids is not None or inbound_addresses is not None:
         conditions.append(
             or_(
-                ScanRun.device_id.in_(sorted(set(source_device_ids or ()))),
-                ConnectionRecord.remote_ip.in_(
+                observation.device_id.in_(sorted(set(source_device_ids or ()))),
+                observation.remote_ip.in_(
                     sorted(set(inbound_addresses or ()))
                 ),
             )
         )
-
-    eligible = (
-        select(
-            ConnectionRecord.id.label("connection_id"),
-            ConnectionRecord.protocol.label("protocol"),
-            ConnectionRecord.local_ip.label("local_ip"),
-            ConnectionRecord.local_port.label("local_port"),
-            ConnectionRecord.remote_ip.label("remote_ip"),
-            ConnectionRecord.remote_port.label("remote_port"),
-            ConnectionRecord.state.label("state"),
-            ConnectionRecord.pid.label("pid"),
-            ConnectionRecord.process_name.label("process_name"),
-            ConnectionRecord.remote_hostname.label("remote_hostname"),
-            ScanRun.id.label("scan_id"),
-            ScanRun.device_id.label("device_id"),
-            ScanRun.started_at.label("started_at"),
-            process_key,
+    if remote_addresses is not None:
+        conditions.append(
+            observation.remote_ip.in_(sorted(set(remote_addresses)))
         )
-        .join(ScanRun, ScanRun.id == ConnectionRecord.scan_run_id)
-        .where(*conditions)
-        .subquery()
-    )
+
     raw_key = (
-        eligible.c.device_id,
-        eligible.c.protocol,
-        eligible.c.remote_ip,
-        eligible.c.remote_port,
-        eligible.c.process_key,
+        observation.device_id,
+        observation.protocol,
+        observation.remote_ip,
+        observation.remote_port,
+        observation.process_name.label("process_key"),
     )
     payload_separator = "\x1f"
     latest_marker = (
         func.lpad(
             cast(
                 func.floor(
-                    func.extract("epoch", eligible.c.started_at) * 1000000
+                    func.extract("epoch", observation.started_at) * 1000000
                 ),
                 String,
             ),
@@ -330,51 +279,106 @@ def aggregate_historical_connections(
             "0",
         )
         + literal("|")
-        + func.lpad(cast(eligible.c.scan_id, String), 20, "0")
+        + func.lpad(cast(observation.scan_run_id, String), 20, "0")
         + literal("|")
-        + func.lpad(cast(eligible.c.connection_id, String), 20, "0")
+        + func.lpad(cast(observation.sample_connection_id, String), 20, "0")
     )
-    hostname_payload = func.max(
-        case(
-            (
-                eligible.c.remote_hostname.is_not(None),
-                latest_marker
-                + literal(payload_separator)
-                + eligible.c.remote_hostname,
-            ),
-            else_=None,
-        )
-    ).label("hostname_payload")
-    aggregate_rows = session.execute(
+    # The marker is built once per observation row in this inner query; the
+    # aggregate below then references the prebuilt column.
+    scanned = (
         select(
             *raw_key,
-            func.min(eligible.c.started_at).label("first_seen"),
-            func.max(eligible.c.started_at).label("last_seen"),
-            func.max(latest_marker).label("latest_marker"),
+            observation.started_at,
+            observation.scan_run_id,
+            observation.remote_hostname,
+            latest_marker.label("marker"),
+        )
+        .where(*conditions)
+        .subquery()
+    )
+    group_columns = (
+        scanned.c.device_id,
+        scanned.c.protocol,
+        scanned.c.remote_ip,
+        scanned.c.remote_port,
+        scanned.c.process_key,
+    )
+    aggregate_rows = session.execute(
+        select(
+            *group_columns,
+            func.min(scanned.c.started_at).label("first_seen"),
+            func.max(scanned.c.started_at).label("last_seen"),
+            func.max(scanned.c.marker).label("latest_marker"),
             func.string_agg(
-                func.distinct(cast(eligible.c.scan_id, String)), literal(",")
-            ).label(
-                "scan_ids"
-            ),
-            func.string_agg(
-                func.distinct(eligible.c.local_ip), literal(",")
-            ).label(
-                "local_ips"
-            ),
-            func.string_agg(
-                func.distinct(cast(eligible.c.local_port, String)), literal(",")
-            ).label(
-                "local_ports"
-            ),
-            func.string_agg(
-                func.distinct(cast(eligible.c.pid, String)), literal(",")
-            ).label("pids"),
-            hostname_payload,
-        ).group_by(*raw_key)
+                cast(scanned.c.scan_run_id, String), literal(",")
+            ).label("scan_ids"),
+            func.max(
+                case(
+                    (
+                        scanned.c.remote_hostname.is_not(None),
+                        scanned.c.marker
+                        + literal(payload_separator)
+                        + scanned.c.remote_hostname,
+                    ),
+                    else_=None,
+                )
+            ).label("hostname_payload"),
+        ).group_by(*group_columns)
     ).all()
     if not aggregate_rows:
         return []
 
+    # Local ip/port/pid unions are aggregated from the distinct per-scan CSV
+    # strings rather than from all observation rows, keeping per-group
+    # aggregation state small enough to stay in memory at scale.
+    distinct_csvs = (
+        select(
+            *raw_key,
+            observation.local_ips,
+            observation.local_ports,
+            observation.pids,
+        )
+        .distinct()
+        .where(*conditions)
+        .subquery()
+    )
+    csv_columns = (
+        distinct_csvs.c.device_id,
+        distinct_csvs.c.protocol,
+        distinct_csvs.c.remote_ip,
+        distinct_csvs.c.remote_port,
+        distinct_csvs.c.process_key,
+    )
+    csv_rows = session.execute(
+        select(
+            *csv_columns,
+            func.string_agg(
+                func.distinct(distinct_csvs.c.local_ips), literal(",")
+            ).label("local_ips"),
+            func.string_agg(
+                func.distinct(distinct_csvs.c.local_ports), literal(",")
+            ).label("local_ports"),
+            func.string_agg(
+                func.distinct(distinct_csvs.c.pids), literal(",")
+            ).label("pids"),
+        ).group_by(*csv_columns)
+    ).all()
+    csv_by_key = {
+        (
+            row.device_id,
+            row.protocol,
+            row.remote_ip,
+            row.remote_port,
+            row.process_key,
+        ): row
+        for row in csv_rows
+    }
+
+    # ANY(array) keeps the sample lookup to a single round trip regardless of
+    # group count; an expanding IN list exceeds driver parameter limits.
+    sample_ids = {
+        int(row.latest_marker.rsplit("|", 1)[1]) for row in aggregate_rows
+    }
     latest_rows = session.execute(
         select(
             ConnectionRecord.id.label("connection_id"),
@@ -391,17 +395,24 @@ def aggregate_historical_connections(
         )
         .join(ScanRun, ScanRun.id == ConnectionRecord.scan_run_id)
         .where(
-            ConnectionRecord.id.in_(
-                int(row.latest_marker.rsplit("|", 1)[1])
-                for row in aggregate_rows
-            )
-        )
+            ConnectionRecord.id
+            == func.any(bindparam("sample_ids", type_=ARRAY(Integer)))
+        ),
+        {"sample_ids": sorted(sample_ids)},
     ).all()
     latest_by_id = {row.connection_id: row for row in latest_rows}
 
     groups: dict[tuple, dict] = {}
     for row in aggregate_rows:
-        latest = latest_by_id[int(row.latest_marker.rsplit("|", 1)[1])]
+        csv_row = csv_by_key.get(
+            (
+                row.device_id,
+                row.protocol,
+                row.remote_ip,
+                row.remote_port,
+                row.process_key,
+            )
+        )
         hostname = (
             row.hostname_payload.split(payload_separator, 1)[1]
             if row.hostname_payload
@@ -420,14 +431,22 @@ def aggregate_historical_connections(
         scan_ids = _csv_int_set(row.scan_ids)
         local_ips = {
             normalized
-            for value in _csv_str_set(row.local_ips)
+            for value in _csv_str_set(csv_row.local_ips if csv_row else None)
             if (normalized := normalize_ip_address(value)) is not None
         }
-        local_ports = _csv_int_set(row.local_ports)
-        pids = _csv_int_set(row.pids)
+        local_ports = _csv_int_set(csv_row.local_ports if csv_row else None)
+        pids = _csv_int_set(csv_row.pids if csv_row else None)
+        marker_parts = row.latest_marker.rsplit("|", 2)
+        latest = latest_by_id.get(int(marker_parts[2]))
+        if latest is None:
+            latest = _degraded_sample(
+                row, marker_parts, local_ips, local_ports, pids
+            )
+            if latest is None:
+                continue
         latest_local_ip = normalize_ip_address(latest.local_ip)
         assert latest_local_ip is not None
-        latest_marker = (
+        latest_marker_value = (
             latest.started_at,
             latest.scan_id,
             latest.connection_id,
@@ -455,7 +474,7 @@ def aggregate_historical_connections(
                 "last_seen": row.last_seen.isoformat(),
                 "_first_seen": row.first_seen,
                 "_last_seen": row.last_seen,
-                "_latest_marker": latest_marker,
+                "_latest_marker": latest_marker_value,
                 "_scan_ids": scan_ids,
                 "_local_ips": local_ips,
                 "_local_ports": local_ports,
@@ -476,7 +495,7 @@ def aggregate_historical_connections(
             bucket["last_seen"] = row.last_seen.isoformat()
         if hostname and not bucket.get("remote_hostname"):
             bucket["remote_hostname"] = hostname
-        if latest_marker > bucket["_latest_marker"]:
+        if latest_marker_value > bucket["_latest_marker"]:
             previous_hostname = bucket.get("remote_hostname")
             bucket.update(
                 {
@@ -494,7 +513,7 @@ def aggregate_historical_connections(
                     "remote_hostname": hostname or previous_hostname,
                     "scan_id": latest.scan_id,
                     "scan_time": latest.started_at.isoformat(),
-                    "_latest_marker": latest_marker,
+                    "_latest_marker": latest_marker_value,
                 }
             )
 
@@ -512,3 +531,52 @@ def aggregate_historical_connections(
         bucket.pop("_latest_marker")
         result.append(bucket)
     return result
+
+
+def aggregate_current_connections(
+    session: Session,
+    current_scans: dict[int, ScanRun],
+    *,
+    source_device_ids: Collection[int] | None = None,
+    inbound_addresses: Collection[str] | None = None,
+    remote_addresses: Collection[str] | None = None,
+) -> list[dict]:
+    current_ids = {scan.id for scan in current_scans.values()}
+    if not current_ids:
+        return []
+    device_ids = {scan.device_id for scan in current_scans.values()}
+    return _aggregate_observation_groups(
+        session,
+        device_ids,
+        current_ids,
+        cutoff=None,
+        source_device_ids=source_device_ids,
+        inbound_addresses=inbound_addresses,
+        remote_addresses=remote_addresses,
+    )
+
+
+def aggregate_historical_connections(
+    session: Session,
+    device_ids: Collection[int],
+    current_scan_ids: Collection[int],
+    window: TopologyWindow,
+    *,
+    now: datetime | None = None,
+    source_device_ids: Collection[int] | None = None,
+    inbound_addresses: Collection[str] | None = None,
+    remote_addresses: Collection[str] | None = None,
+) -> list[dict]:
+    if window == "current":
+        raise ValueError("历史聚合不接受 current 时间范围")
+    reference = now or datetime.now(timezone.utc)
+    cutoff = reference - WINDOW_DELTAS[window]
+    return _aggregate_observation_groups(
+        session,
+        device_ids,
+        current_scan_ids,
+        cutoff=cutoff,
+        source_device_ids=source_device_ids,
+        inbound_addresses=inbound_addresses,
+        remote_addresses=remote_addresses,
+    )

@@ -11,6 +11,8 @@
   let graph = null;
   let mode = "device";
   let activeTopologyController = null;
+  let processDebounce = null;
+  let drawerRequestSeq = 0;
   const destroyGraph = () => {
     source = null;
     if (graph) graph.destroy();
@@ -51,7 +53,7 @@
     const timeout = window.setTimeout(() => {
       timedOut = true;
       controller.abort();
-    }, 15000);
+    }, 90000);
     try {
       return await fetch(url, {signal: controller.signal});
     } catch (error) {
@@ -86,6 +88,15 @@
     return (!protocol || row.protocol === protocol)
       && (!state || row.state === state)
       && (!process || `${row.process_name || ""} ${pids}`.toLowerCase().includes(process));
+  };
+
+  const topologyFilterParams = () => {
+    const params = new URLSearchParams();
+    if (protocolSelect.value) params.set("protocol", protocolSelect.value);
+    if (stateSelect.value) params.set("state", stateSelect.value);
+    const process = processInput.value.trim();
+    if (process) params.set("process", process);
+    return params;
   };
 
   const connectionTable = (rows) => {
@@ -159,6 +170,44 @@
       <p class="muted">点击拓扑中的节点或连线查看详细信息。</p>`;
   };
 
+  const fetchEdgeConnections = async (sourceId, targetId) => {
+    const params = topologyFilterParams();
+    params.set("window", windowSelect.value);
+    params.set("source", sourceId);
+    params.set("target", targetId);
+    const response = await fetch(`/api/topology/edge-connections?${params}`);
+    if (!response.ok) return {connections: []};
+    return response.json();
+  };
+
+  const showDrawerLoading = (title, subtitle) => {
+    drawer.innerHTML = `<p class="eyebrow">连接详情</p>
+      <h2>${escapeHtml(title)}</h2><p class="drawer-subtitle">${escapeHtml(subtitle || "")}</p>
+      <p class="muted">正在加载连接…</p>`;
+  };
+
+  const loadEdgeConnections = async (peer, sourceId, targetId) => {
+    const seq = ++drawerRequestSeq;
+    showDrawerLoading(peer.label, peer.subtitle);
+    const result = await fetchEdgeConnections(sourceId, targetId);
+    if (seq !== drawerRequestSeq) return;
+    renderDrawer(peer.label, peer.subtitle, result.connections);
+  };
+
+  const loadNodeConnections = async (nodeData, pairs) => {
+    const seq = ++drawerRequestSeq;
+    showDrawerLoading(nodeData.label, nodeData.subtitle);
+    const results = await Promise.all(
+      pairs.map(pair => fetchEdgeConnections(pair.source, pair.target))
+    );
+    if (seq !== drawerRequestSeq) return;
+    renderDrawer(
+      nodeData.label,
+      nodeData.subtitle,
+      results.flatMap(result => result.connections)
+    );
+  };
+
   const assignLayoutLevels = (elements, currentMode) => {
     const edges = elements.filter(item => item.data.source && item.data.target);
     const nodes = elements
@@ -203,22 +252,30 @@
   };
 
   const filteredElements = () => {
-    let edges = source.edges.map(edge => {
-      const connections = edge.data.connections.filter(connectionMatches);
-      const currentCount = connections.filter(row => row.is_current).length;
-      return {
+    let edges;
+    if (mode === "cluster") {
+      edges = source.edges.map(edge => ({
         ...edge,
-        data: {
-          ...edge.data,
-          connections,
-          count: connections.length,
-          label: String(connections.length),
-          current_count: currentCount,
-          historical_count: connections.length - currentCount,
-          is_current: currentCount > 0 ? 1 : 0
-        }
-      };
-    }).filter(edge => edge.data.count > 0);
+        data: {...edge.data, is_current: edge.data.is_current ? 1 : 0}
+      }));
+    } else {
+      edges = source.edges.map(edge => {
+        const connections = edge.data.connections.filter(connectionMatches);
+        const currentCount = connections.filter(row => row.is_current).length;
+        return {
+          ...edge,
+          data: {
+            ...edge.data,
+            connections,
+            count: connections.length,
+            label: String(connections.length),
+            current_count: currentCount,
+            historical_count: connections.length - currentCount,
+            is_current: currentCount > 0 ? 1 : 0
+          }
+        };
+      }).filter(edge => edge.data.count > 0);
+    }
     const selectedClusterId = clusterSelect.value;
     if (mode === "cluster") {
       edges = selectedClusterId
@@ -359,12 +416,14 @@
       focusEdge(event.target);
       const data = event.target.data();
       const peer = graph.getElementById(data.target).data();
+      if (mode === "cluster") {
+        return loadEdgeConnections(peer, data.source, data.target);
+      }
       renderDrawer(peer.label, peer.subtitle, data.connections);
     });
     graph.on("tap", "node", event => {
       const node = event.target;
       focusNode(node);
-      const rows = node.connectedEdges().flatMap(edge => edge.data("connections") || []);
       const members = node.data("members") || [];
       if (node.data("kind") === "cluster") {
         drawer.innerHTML = `<p class="eyebrow">集群详情</p>
@@ -373,9 +432,17 @@
           <div class="member-list">${members.map(member => `<article>
             <b>${escapeHtml(member.name)}</b>
             <small>${escapeHtml(member.host)} · ${member.scan_time ? "已有快照" : "暂无快照"}</small>
-          </article>`).join("")}</div>
-          ${connectionTable(rows)}`;
+          </article>`).join("")}</div>`;
+        return;
+      }
+      if (mode === "cluster") {
+        const pairs = node.connectedEdges().map(edge => ({
+          source: edge.data("source"),
+          target: edge.data("target")
+        }));
+        return loadNodeConnections(node.data(), pairs);
       } else {
+        const rows = node.connectedEdges().flatMap(edge => edge.data("connections") || []);
         renderDrawer(node.data("label"), node.data("subtitle"), rows);
       }
     });
@@ -436,9 +503,10 @@
     empty.querySelector("p").textContent =
       windowSelect.value === "current"
         ? "系统正在读取各设备最近一次成功快照。"
-        : `系统正在汇总最近 ${windowSelect.value} 内的成功快照。`;
+        : `系统正在汇总最近 ${windowSelect.value} 内的成功快照，集群较大时首次加载可能需要一分钟，请耐心等待。`;
     const params = new URLSearchParams({window: windowSelect.value});
     params.set("cluster_id", clusterSelect.value.replace("cluster-", ""));
+    topologyFilterParams().forEach((value, key) => params.set(key, value));
     let response;
     try {
       response = await fetchTopology(`/api/topology/clusters?${params}`);
@@ -481,11 +549,15 @@
   document.getElementById("fit-topology-button").addEventListener("click", fitGraph);
   document.getElementById("reset-topology-button").addEventListener("click", resetGraphView);
   deviceSelect.addEventListener("change", load);
-  protocolSelect.addEventListener("change", draw);
-  stateSelect.addEventListener("change", draw);
+  protocolSelect.addEventListener("change", () => (mode === "device" ? draw() : load()));
+  stateSelect.addEventListener("change", () => (mode === "device" ? draw() : load()));
   clusterSelect.addEventListener("change", load);
   windowSelect.addEventListener("change", load);
-  processInput.addEventListener("input", draw);
+  processInput.addEventListener("input", () => {
+    if (mode === "device") return draw();
+    window.clearTimeout(processDebounce);
+    processDebounce = window.setTimeout(load, 350);
+  });
   document.getElementById("scan-button").addEventListener("click", async () => {
     if (!deviceSelect.value) return toast("请先选择设备", "error");
     const button = document.getElementById("scan-button");

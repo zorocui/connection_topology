@@ -5,6 +5,7 @@ from sqlalchemy import func, select
 from app.models import (
     Cluster,
     ConnectionRecord,
+    ConnectionServiceObservation,
     Device,
     OSType,
     ScanRun,
@@ -12,7 +13,11 @@ from app.models import (
     ScanTrigger,
 )
 from app.services.retention import resolve_device_retention
-from app.services.scheduler import purge_expired_scans
+from app.services.scheduler import (
+    purge_expired_scans,
+    purge_raw_connection_records,
+)
+from app.services.service_observations import sync_service_observations
 
 NOW = datetime(2026, 7, 31, 3, 0, tzinfo=timezone.utc)
 
@@ -94,7 +99,7 @@ def test_purge_expired_scans_uses_each_device_policy_and_cascades(app):
         )
         session.commit()
 
-        assert purge_expired_scans(session, 7, now=NOW) == 3
+        assert purge_expired_scans(session, 7, now=NOW, chunk_size=1) == 3
         remaining_ages = sorted(
             (NOW - scan.started_at.replace(tzinfo=timezone.utc)).days
             for scan in session.scalars(select(ScanRun))
@@ -105,3 +110,40 @@ def test_purge_expired_scans_uses_each_device_policy_and_cascades(app):
 
         assert remaining_ages == [6, 13, 29]
         assert connection_count == 0
+
+
+def test_purge_raw_connection_records_keeps_baselines_and_observations(app):
+    with app.state.session_factory() as session:
+        device = _device(app, "rawreten")
+        session.add(device)
+        scans = [
+            _scan(device, 8, with_connection=True),
+            _scan(device, 6, with_connection=True),
+            _scan(device, 3, with_connection=True),
+            _scan(device, 1, with_connection=True),
+        ]
+        session.add_all(scans)
+        session.commit()
+        for scan in scans:
+            sync_service_observations(session, scan)
+        session.commit()
+
+        deleted = purge_raw_connection_records(
+            session, 2, now=NOW, chunk_size=1
+        )
+
+        # Only the two oldest scans lose their raw rows; the latest two
+        # successful scans per device are kept as topology/diff baselines.
+        assert deleted == 2
+        remaining_record_scan_ids = {
+            record.scan_run_id
+            for record in session.scalars(select(ConnectionRecord))
+        }
+        assert remaining_record_scan_ids == {scans[2].id, scans[3].id}
+        # Scan runs and observations stay for the full history retention.
+        assert session.scalar(select(func.count(ScanRun.id))) == 4
+        assert session.scalar(
+            select(func.count(ConnectionServiceObservation.id))
+        ) == 4
+        # Idempotent: a second run finds nothing left to purge.
+        assert purge_raw_connection_records(session, 2, now=NOW) == 0
