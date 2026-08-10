@@ -465,17 +465,6 @@
     graph.on("tap", "node", event => {
       const node = event.target;
       focusNode(node);
-      const members = node.data("members") || [];
-      if (node.data("kind") === "cluster") {
-        drawer.innerHTML = `<p class="eyebrow">集群详情</p>
-          <h2>${escapeHtml(node.data("label"))}</h2>
-          <p class="drawer-subtitle">${escapeHtml(node.data("subtitle"))}</p>
-          <div class="member-list">${members.map(member => `<article>
-            <b>${escapeHtml(member.name)}</b>
-            <small>${escapeHtml(member.host)} · ${member.scan_time ? "已有快照" : "暂无快照"}</small>
-          </article>`).join("")}</div>`;
-        return;
-      }
       if (mode === "cluster") {
         const pairs = node.connectedEdges().map(edge => ({
           source: edge.data("source"),

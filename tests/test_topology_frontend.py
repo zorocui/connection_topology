@@ -14,7 +14,7 @@ def test_cluster_filter_requires_explicit_target_selection():
     assert "目标集群" in template
     assert '<option value="">选择一个集群</option>' in template
     assert "全部集群和设备" not in template
-    assert "topology.js') }}?v=20260807-slim-graph" in template
+    assert "topology.js') }}?v=20260810-cluster-connections" in template
 
 
 def test_cluster_mode_waits_for_explicit_selection_before_loading():
