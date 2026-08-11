@@ -18,7 +18,7 @@
       {% for scan in scans %}
         <tr data-device="{{ scan.device_id }}" data-status="{{ scan.status.value }}">
           <td class="mono">#{{ "%05d"|format(scan.id) }}</td>
-          <td>设备 {{ scan.device_id }}</td>
+          <td>{{ scan.device.name }}</td>
           <td>{% if scan.trigger_type.value == "manual" %}手动{% else %}定时{% endif %}</td>
           <td>{{ scan.started_at|beijing_time }}</td>
           <td><span class="run-state {{ scan.status.value }}">{% if scan.status.value == "success" %}成功{% elif scan.status.value == "failed" %}失败{% else %}运行中{% endif %}</span>

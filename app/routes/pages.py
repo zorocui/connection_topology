@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import desc, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.database import get_db
 from app.models import Cluster, Device, ScanRun, ScanStatus, SystemSetting
@@ -109,7 +109,10 @@ def history_page(request: Request, db: Session = Depends(get_db)):
     context = _base_context(request, "history")
     context["devices"] = db.scalars(select(Device).order_by(Device.name)).all()
     context["scans"] = db.scalars(
-        select(ScanRun).order_by(desc(ScanRun.started_at)).limit(100)
+        select(ScanRun)
+        .options(selectinload(ScanRun.device))
+        .order_by(desc(ScanRun.started_at))
+        .limit(100)
     ).all()
     return templates.TemplateResponse(request, "history.html", context)
 

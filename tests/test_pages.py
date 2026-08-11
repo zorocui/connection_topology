@@ -202,6 +202,38 @@ def test_topology_page_contains_time_window_and_history_legend(client):
     assert "已断开连接" in response.text
 
 
+def test_history_device_column_uses_device_name(client, app):
+    with app.state.session_factory() as session:
+        device = Device(
+            name="history-device-name",
+            host="10.0.0.91",
+            os_type=OSType.LINUX,
+            port=22,
+            username="tester",
+            encrypted_password=app.state.cipher.encrypt("secret"),
+        )
+        session.add(device)
+        session.flush()
+        device_id = device.id
+        session.add(
+            ScanRun(
+                device_id=device_id,
+                trigger_type=ScanTrigger.MANUAL,
+                status=ScanStatus.SUCCESS,
+                connection_count=0,
+            )
+        )
+        session.commit()
+
+    response = client.get("/history")
+    history_table = response.text.split('<table id="history-table">', 1)[1].split(
+        "</table>", 1
+    )[0]
+
+    assert "<td>history-device-name</td>" in history_table
+    assert f"<td>设备 {device_id}</td>" not in history_table
+
+
 def test_pages_render_all_visible_times_in_beijing(client, app):
     with app.state.session_factory() as session:
         device = Device(
