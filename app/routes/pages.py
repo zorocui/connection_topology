@@ -50,7 +50,11 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 @router.get("/topology", response_class=HTMLResponse)
 def topology_page(request: Request, db: Session = Depends(get_db)):
     context = _base_context(request, "topology")
-    context["devices"] = db.scalars(select(Device).order_by(Device.name)).all()
+    context["devices"] = db.scalars(
+        select(Device)
+        .where(Device.collection_enabled.is_(True))
+        .order_by(Device.name)
+    ).all()
     context["clusters"] = db.scalars(select(Cluster).order_by(Cluster.name)).all()
     return templates.TemplateResponse(request, "topology.html", context)
 

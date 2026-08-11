@@ -143,6 +143,44 @@ def test_topology_page_contains_mode_switch(client):
     assert "集群模式" in response.text
 
 
+def test_topology_device_filter_excludes_annotation_only_devices(client, app):
+    with app.state.session_factory() as session:
+        session.add_all(
+            [
+                Device(
+                    name="collectable-target",
+                    host="10.40.0.1",
+                    os_type=OSType.LINUX,
+                    port=22,
+                    username="collector",
+                    encrypted_password=app.state.cipher.encrypt("secret"),
+                    scheduled_enabled=False,
+                    collection_enabled=True,
+                ),
+                Device(
+                    name="annotation-only-target",
+                    host="10.40.0.2",
+                    os_type=OSType.LINUX,
+                    port=22,
+                    username="",
+                    encrypted_password="",
+                    scheduled_enabled=False,
+                    collection_enabled=False,
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.get("/topology")
+    device_select = response.text.split('<select id="device-filter">', 1)[1].split(
+        "</select>", 1
+    )[0]
+
+    assert "collectable-target" in device_select
+    assert "annotation-only-target" not in device_select
+    assert 'id="cluster-filter"' in response.text
+
+
 def test_topology_page_contains_canvas_view_controls(client):
     response = client.get("/topology")
 
